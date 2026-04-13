@@ -102,3 +102,16 @@ class PaymentApplication(Base):
     payment = relationship("Payment")
     invoice = relationship("Invoice")
     member = relationship("Member")
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, default="OWNER", nullable=False)   # OWNER for now
+    is_active = Column(Boolean, default=True, nullable=False)
+    member_id = Column(Integer, ForeignKey("members.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    member = relationship("Member")

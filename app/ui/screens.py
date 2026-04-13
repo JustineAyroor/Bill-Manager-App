@@ -254,44 +254,36 @@ def _pill(label, text):
       <b style="margin-right:6px;">{label}:</b>{text}
     </div>
     """
-# def _plan_totals_html():
 
-#     with SessionLocal() as db:
-#         t = plan_totals(db)
-
-#     return f"""
-#     <div style="display:flex; gap:20px; flex-wrap:wrap">
-
-#         <div style="background:#1f2937;padding:20px;border-radius:12px;color:white;min-width:200px">
-#             <div style="font-size:14px;opacity:0.7">Total Due</div>
-#             <div style="font-size:28px;font-weight:bold">${t['total_due']:.2f}</div>
-#         </div>
-
-#         <div style="background:#065f46;padding:20px;border-radius:12px;color:white;min-width:200px">
-#             <div style="font-size:14px;opacity:0.7">Recovered</div>
-#             <div style="font-size:28px;font-weight:bold">${t['recovered']:.2f}</div>
-#         </div>
-
-#         <div style="background:#7c2d12;padding:20px;border-radius:12px;color:white;min-width:200px">
-#             <div style="font-size:14px;opacity:0.7">Remaining</div>
-#             <div style="font-size:28px;font-weight:bold">${t['remaining']:.2f}</div>
-#         </div>
-
-#         <div style="background:#1e3a8a;padding:20px;border-radius:12px;color:white;min-width:200px">
-#             <div style="font-size:14px;opacity:0.7">Total Bill Paid</div>
-#             <div style="font-size:28px;font-weight:bold">${t['total_bill_paid']:.2f}</div>
-#         </div>
-
-#     </div>
-#     """
-
-def _df_balances():
+def _df_balances(role="", member_id=None):
     with SessionLocal() as db:
         data = member_balances(db)
-    return pd.DataFrame(data)
 
+    df = pd.DataFrame(data)
 
-def ui_dashboard(demo):
+    role = (role or "").strip().upper()
+    if role == "MEMBER" and member_id is not None and not df.empty:
+        df = df[df["member_id"] == int(member_id)]
+
+    return df
+
+def ui_dashboard(demo,current_role, current_member_id):
+    def _dashboard_reminder_panel_update(role):
+        role = (role or "").strip().upper()
+        return gr.update(visible=(role == "OWNER"))
+
+    def _preview_reminders_for_role(role):
+        role = (role or "").strip().upper()
+        if role == "MEMBER":
+            return pd.DataFrame()
+        return _preview_reminders_df()
+
+    def _send_reminders_for_role(role):
+        role = (role or "").strip().upper()
+        if role == "MEMBER":
+            return "Not allowed for MEMBER role.", pd.DataFrame()
+        return _send_reminders_now()
+
     with gr.Column():
         gr.Markdown("## Dashboard — Who owes what")
 
@@ -305,19 +297,19 @@ def ui_dashboard(demo):
                     show_only_owed = gr.Checkbox(label="Show only members who still owe", value=False)
                     sort_by = gr.Dropdown(["Name", "Most Due", "Most Paid"], value="Name", label="Sort")
 
-                chart = gr.Plot(value=_balances_chart_plotly(False, "Name"))
+                chart = gr.Plot(value=_balances_chart_plotly("", None, False, "Name"))
 
                 with gr.Row():
                     refresh_chart = gr.Button("🔄 Refresh chart")
                     refresh_chart.click(
                         fn=_balances_chart_plotly,
-                        inputs=[show_only_owed, sort_by],
+                        inputs=[current_role, current_member_id, show_only_owed, sort_by],
                         outputs=[chart],
                     )
 
                 # Auto-update chart on control changes
-                show_only_owed.change(fn=_balances_chart_plotly, inputs=[show_only_owed, sort_by], outputs=[chart])
-                sort_by.change(fn=_balances_chart_plotly, inputs=[show_only_owed, sort_by], outputs=[chart])
+                show_only_owed.change(fn=_balances_chart_plotly, inputs=[current_role, current_member_id, show_only_owed, sort_by], outputs=[chart])
+                sort_by.change(fn=_balances_chart_plotly, inputs=[current_role, current_member_id, show_only_owed, sort_by], outputs=[chart])
 
                 # Plan totals (HTML KPI cards)
                 totals_html = gr.HTML(value=_plan_totals_html())
@@ -329,44 +321,56 @@ def ui_dashboard(demo):
                 export_file = gr.File(label="Exported file")
                 export_btn.click(fn=_export_click, inputs=[], outputs=[export_file])
 
-                gr.Markdown("### Email reminders")
+                with gr.Column(visible=False) as reminders_panel:
+                    gr.Markdown("### Email reminders")
 
-                with gr.Row():
-                    preview_btn = gr.Button("👀 Preview")
-                    send_btn = gr.Button("📨 Send now")
+                    with gr.Row():
+                        preview_btn = gr.Button("👀 Preview")
+                        send_btn = gr.Button("📨 Send now")
 
-                send_status = gr.Textbox(label="Status", interactive=False)
-                preview_table = gr.Dataframe(value=_preview_reminders_df(), interactive=False)
+                    send_status = gr.Textbox(label="Status", interactive=False)
+                    preview_table = gr.Dataframe(value=pd.DataFrame(), interactive=False)
 
-                preview_btn.click(fn=_preview_reminders_df, inputs=[], outputs=[preview_table])
-                send_btn.click(fn=_send_reminders_now, inputs=[], outputs=[send_status, preview_table])
+                    preview_btn.click(fn=_preview_reminders_for_role, inputs=[current_role], outputs=[preview_table])
+                    send_btn.click(fn=_send_reminders_for_role, inputs=[current_role], outputs=[send_status, preview_table])
 
         # --- Bottom: Table + Refresh controls ---
         gr.Markdown("### Balances table")
-        balances = gr.Dataframe(value=_df_balances(), interactive=False)
+        balances = gr.Dataframe(value=_df_balances("", None), interactive=False)
 
         with gr.Row():
             refresh_table = gr.Button("🔄 Refresh table")
             refresh_all = gr.Button("🔁 Refresh everything")
 
-        refresh_table.click(fn=_df_balances, inputs=[], outputs=[balances])
+        refresh_table.click(fn=_df_balances, inputs=[current_role, current_member_id], outputs=[balances])
 
         # Refresh everything: chart + table + totals + reminder preview
-        refresh_all.click(fn=_balances_chart_plotly, inputs=[show_only_owed, sort_by], outputs=[chart])
-        refresh_all.click(fn=_df_balances, inputs=[], outputs=[balances])
+        refresh_all.click(fn=_balances_chart_plotly, inputs=[current_role, current_member_id, show_only_owed, sort_by], outputs=[chart])
+        refresh_all.click(fn=_df_balances, inputs=[current_role, current_member_id], outputs=[balances])
         refresh_all.click(fn=_plan_totals_html, inputs=[], outputs=[totals_html])
-        refresh_all.click(fn=_preview_reminders_df, inputs=[], outputs=[preview_table])
+        refresh_all.click(fn=_preview_reminders_for_role, inputs=[current_role], outputs=[preview_table])
 
         # Optional: initial load refresh (ensures the dashboard starts consistent)
         gr.on(
             triggers=[demo.load],
             fn=_balances_chart_plotly,
-            inputs=[show_only_owed, sort_by],
+            inputs=[current_role, current_member_id, show_only_owed, sort_by],
             outputs=[chart],
         )
-        gr.on(triggers=[demo.load], fn=_df_balances, inputs=[], outputs=[balances])
+        gr.on(
+            triggers=[demo.load],
+            fn=_dashboard_reminder_panel_update,
+            inputs=[current_role],
+            outputs=[reminders_panel],
+        )
+        current_role.change(
+            fn=_dashboard_reminder_panel_update,
+            inputs=[current_role],
+            outputs=[reminders_panel],
+        )
+        gr.on(triggers=[demo.load], fn=_df_balances, inputs=[current_role, current_member_id], outputs=[balances])
         gr.on(triggers=[demo.load], fn=_plan_totals_html, inputs=[], outputs=[totals_html])
-        gr.on(triggers=[demo.load], fn=_preview_reminders_df, inputs=[], outputs=[preview_table])
+        gr.on(triggers=[demo.load], fn=_preview_reminders_for_role, inputs=[current_role], outputs=[preview_table])
 
     return
 
@@ -375,8 +379,8 @@ def _export_click():
         path = export_excel(db)
     return path
 
-def _balances_chart_plotly(show_only_owed: bool = False, sort_by: str = "Name"):
-    df = _df_balances().copy()
+def _balances_chart_plotly(role="", member_id=None,show_only_owed: bool = False, sort_by: str = "Name"):
+    df = _df_balances(role, member_id).copy()
     if df.empty:
         return go.Figure()
 
@@ -632,21 +636,63 @@ def _recompute_owner_for_selected_invoice(invoice_pick):
     return "✅ Recomputed owner allocation", _invoice_allocations_df(invoice_id)
 
 
-def ui_invoices(demo):
+def ui_invoices(demo, current_role):
+    def _invoices_owner_controls_update(role):
+        role = (role or "").strip().upper()
+        is_owner = role != "MEMBER"
+        return (
+            gr.update(visible=is_owner),         # invoice_editor_controls
+            gr.update(visible=is_owner),         # alloc_editor_controls
+            gr.update(interactive=is_owner),     # inv_year
+            gr.update(interactive=is_owner),     # inv_month
+            gr.update(interactive=is_owner),     # inv_total
+            gr.update(visible=is_owner),         # invoice_msg
+            gr.update(visible=is_owner),         # alloc_msg
+        )
+
     with gr.Column():
+        def _deny_member_write(role, msg="❌ MEMBER role is read-only in this section."):
+            if (role or "").strip().upper() == "MEMBER":
+                return True, msg
+            return False, ""
+
+        def _create_new_invoice_guard(role, year, month, total):
+            denied, msg = _deny_member_write(role)
+            if denied:
+                return msg, gr.update()
+            return _create_new_invoice(year, month, total)
+
+        def _save_invoice_changes_guard(role, invoice_pick, year, month, total):
+            denied, msg = _deny_member_write(role)
+            if denied:
+                return msg, gr.update(), _invoice_allocations_df(_parse_invoice_id(invoice_pick))
+            return _save_invoice_changes(invoice_pick, year, month, total)
+
+        def _save_allocation_guard(role, invoice_pick, member_name, amount_due):
+            denied, msg = _deny_member_write(role)
+            if denied:
+                return msg, _invoice_allocations_df(_parse_invoice_id(invoice_pick))
+            return _save_allocation_for_selected_invoice(invoice_pick, member_name, amount_due)
+
+        def _recompute_owner_guard(role, invoice_pick):
+            denied, msg = _deny_member_write(role)
+            if denied:
+                return msg, _invoice_allocations_df(_parse_invoice_id(invoice_pick))
+            return _recompute_owner_for_selected_invoice(invoice_pick)
+
         gr.Markdown("## Invoices (Create / Edit)")
 
         with gr.Row():
             invoice_pick = gr.Dropdown(label="Select invoice", choices=[], value=None)
             refresh_btn = gr.Button("🔄 Refresh")
 
-        # Invoice editor
+        # Invoice details are always visible; owner-only buttons are controlled separately.
         with gr.Row():
             inv_year = gr.Number(label="Year", precision=0)
             inv_month = gr.Dropdown(MONTHS, label="Month")
             inv_total = gr.Number(label="Invoice total ($)", value=0)
 
-        with gr.Row():
+        with gr.Row(visible=False) as invoice_editor_controls:
             create_new_btn = gr.Button("➕ Create new")
             save_invoice_btn = gr.Button("💾 Save invoice changes")
 
@@ -656,12 +702,13 @@ def ui_invoices(demo):
 
         gr.Markdown("### Allocations for selected invoice")
 
-        member_pick = gr.Dropdown(label="Member", choices=[], value=None)
-        alloc_amount = gr.Number(label="Amount due", value=0)
+        with gr.Column(visible=False) as alloc_editor_controls:
+            member_pick = gr.Dropdown(label="Member", choices=[], value=None)
+            alloc_amount = gr.Number(label="Amount due", value=0)
 
-        with gr.Row():
-            add_alloc_btn = gr.Button("Save allocation (upsert)")
-            recompute_btn = gr.Button("Recompute owner allocation")
+            with gr.Row():
+                add_alloc_btn = gr.Button("Save allocation (upsert)")
+                recompute_btn = gr.Button("Recompute owner allocation")
 
         alloc_msg = gr.Textbox(label="Allocation status", interactive=False)
 
@@ -676,26 +723,26 @@ def ui_invoices(demo):
         )
 
         create_new_btn.click(
-            fn=_create_new_invoice,
-            inputs=[inv_year, inv_month, inv_total],
+            fn=_create_new_invoice_guard,
+            inputs=[current_role, inv_year, inv_month, inv_total],
             outputs=[invoice_msg, invoice_pick],
         )
 
         save_invoice_btn.click(
-            fn=_save_invoice_changes,
-            inputs=[invoice_pick, inv_year, inv_month, inv_total],
+            fn=_save_invoice_changes_guard,
+            inputs=[current_role, invoice_pick, inv_year, inv_month, inv_total],
             outputs=[invoice_msg, invoice_pick, alloc_table],
         )
 
         add_alloc_btn.click(
-            fn=_save_allocation_for_selected_invoice,
-            inputs=[invoice_pick, member_pick, alloc_amount],
+            fn=_save_allocation_guard,
+            inputs=[current_role, invoice_pick, member_pick, alloc_amount],
             outputs=[alloc_msg, alloc_table],
         )
 
         recompute_btn.click(
-            fn=_recompute_owner_for_selected_invoice,
-            inputs=[invoice_pick],
+            fn=_recompute_owner_guard,
+            inputs=[current_role, invoice_pick],
             outputs=[alloc_msg, alloc_table],
         )
 
@@ -705,6 +752,17 @@ def ui_invoices(demo):
             fn=_load_invoice_and_member_choices,
             inputs=[],
             outputs=[invoice_pick, member_pick],
+        )
+        gr.on(
+            triggers=[demo.load],
+            fn=_invoices_owner_controls_update,
+            inputs=[current_role],
+            outputs=[invoice_editor_controls, alloc_editor_controls, inv_year, inv_month, inv_total, invoice_msg, alloc_msg],
+        )
+        current_role.change(
+            fn=_invoices_owner_controls_update,
+            inputs=[current_role],
+            outputs=[invoice_editor_controls, alloc_editor_controls, inv_year, inv_month, inv_total, invoice_msg, alloc_msg],
         )
 
     return
@@ -749,12 +807,22 @@ def _payment_choice_list(limit=200):
 def _payment_pick_update():
     return gr.update(choices=_payment_choice_list(limit=200), value=None)
 
-def _payments_page_df(page=1, page_size=30, direction_filter="All", member_filter=None, invoice_filter=None, search_text=""):
+def _payments_page_df(
+    page=1,
+    page_size=30,
+    direction_filter="All",
+    member_filter=None,
+    invoice_filter=None,
+    search_text="",
+    current_role="",
+    forced_member_id=None,
+):
     page = int(page or 1)
     page = 1 if page < 1 else page
     page_size = int(page_size or 30)
     offset = (page - 1) * page_size
 
+    role = (current_role or "").strip().upper()
     member_id = _parse_id(member_filter)
     invoice_id = _parse_id(invoice_filter)
 
@@ -778,7 +846,19 @@ def _payments_page_df(page=1, page_size=30, direction_filter="All", member_filte
 
         if direction_filter in ("INBOUND", "OUTBOUND"):
             q = q.where(Payment.direction == direction_filter)
-        if member_id is not None:
+        if role == "MEMBER":
+            try:
+                mid = int(forced_member_id) if forced_member_id is not None else None
+            except Exception:
+                mid = None
+            if mid is not None:
+                q = q.where(
+                    (Payment.direction == "OUTBOUND")
+                    | ((Payment.direction == "INBOUND") & (Payment.member_id == mid))
+                )
+            else:
+                q = q.where(Payment.direction == "OUTBOUND")
+        elif member_id is not None:
             q = q.where(Payment.member_id == member_id)
         if invoice_id is not None:
             q = q.where(Payment.invoice_id == invoice_id)
@@ -976,9 +1056,74 @@ def _reconcile_all():
     df = pd.DataFrame(results)
     return f"✅ Reconciled {len(results)} members", df
     
-def ui_payments(demo):
+def ui_payments(demo, current_role, current_member_id):
+    def _payments_owner_controls_update(role):
+        role = (role or "").strip().upper()
+        is_owner = role != "MEMBER"
+        return (
+            gr.update(visible=is_owner),  # add_payment_section
+            gr.update(visible=is_owner),  # reconcile_section
+            gr.update(visible=is_owner),  # edit_delete_section
+        )
+
+    def _payments_member_filter_update(role, member_id):
+        role = (role or "").strip().upper()
+        if role == "MEMBER":
+            val = _member_choice_from_id(member_id) if member_id is not None else None
+            return gr.update(choices=[val] if val else [], value=val, visible=False)
+        return gr.update(choices=_member_choice_list(), value=None, visible=(role == "OWNER"))
+
+    def _clear_payment_filters(role, member_id, page_size):
+        member_update = _payments_member_filter_update(role, member_id)
+        table_df = _payments_page_df(
+            page=1,
+            page_size=page_size,
+            direction_filter="All",
+            member_filter=(member_update.get("value") if isinstance(member_update, dict) else None),
+            invoice_filter=None,
+            search_text="",
+            current_role=role,
+            forced_member_id=member_id,
+        )
+        return (
+            "All",            # f_dir
+            member_update,    # f_member
+            None,             # f_invoice
+            "",               # f_search
+            1,                # page
+            table_df,         # payments_table
+        )
+
     with gr.Column():
         gr.Markdown("## Payments")
+
+        def _is_member(role):
+            return (role or "").strip().upper() == "MEMBER"
+
+        def _add_payment_guard(role, when, direction, member_pick, invoice_pick, amount, description):
+            if _is_member(role):
+                return "❌ MEMBER role is read-only in Payments.", pd.DataFrame()
+            return _add_payment_v4(when, direction, member_pick, invoice_pick, amount, description)
+
+        def _save_payment_guard(role, payment_id, when, direction, member_pick, invoice_pick, amount, description):
+            if _is_member(role):
+                return "❌ MEMBER role is read-only in Payments."
+            return _save_payment_edits_v4(payment_id, when, direction, member_pick, invoice_pick, amount, description)
+
+        def _delete_payment_guard(role, payment_id):
+            if _is_member(role):
+                return ("❌ MEMBER role is read-only in Payments.", None, "Pick a payment and click **Load**.", None, "", "INBOUND", None, None, 0.0, "")
+            return _delete_payment_v4(payment_id)
+
+        def _reconcile_member_guard(role, member_pick):
+            if _is_member(role):
+                return "❌ MEMBER role is read-only in Payments.", pd.DataFrame()
+            return _reconcile_member(member_pick)
+
+        def _reconcile_all_guard(role):
+            if _is_member(role):
+                return "❌ MEMBER role is read-only in Payments.", pd.DataFrame()
+            return _reconcile_all()
 
         # ---------------- Dropdown loaders ----------------
         def _load_dropdowns():
@@ -994,35 +1139,37 @@ def ui_payments(demo):
             )
 
         # ---------------- Add payment ----------------
-        with gr.Accordion("➕ Record a payment", open=True):
-            with gr.Row():
-                add_when = gr.Textbox(label="Date (YYYY-MM-DD)", value=date.today().isoformat())
-                add_direction = gr.Dropdown(["INBOUND", "OUTBOUND"], value="INBOUND", label="Direction")
+        with gr.Column(visible=False) as add_payment_section:
+            with gr.Accordion("➕ Record a payment", open=True):
+                with gr.Row():
+                    add_when = gr.Textbox(label="Date (YYYY-MM-DD)", value=date.today().isoformat())
+                    add_direction = gr.Dropdown(["INBOUND", "OUTBOUND"], value="INBOUND", label="Direction")
 
-            with gr.Row():
-                add_member = gr.Dropdown(label="Member (required for INBOUND)", choices=[], value=None)
-                add_invoice = gr.Dropdown(label="Link to invoice (optional)", choices=[], value=None)
+                with gr.Row():
+                    add_member = gr.Dropdown(label="Member (required for INBOUND)", choices=[], value=None)
+                    add_invoice = gr.Dropdown(label="Link to invoice (optional)", choices=[], value=None)
 
-            with gr.Row():
-                add_amount = gr.Number(label="Amount", value=0)
-                add_desc = gr.Textbox(label="Description", value="")
+                with gr.Row():
+                    add_amount = gr.Number(label="Amount", value=0)
+                    add_desc = gr.Textbox(label="Description", value="")
 
-            add_btn = gr.Button("Save payment")
-            add_status = gr.Textbox(label="Status", interactive=False)
-            applied_preview = gr.Dataframe(label="Applied (FIFO preview)", interactive=False)
-        add_direction.change(fn=_toggle_member_visibility, inputs=[add_direction], outputs=[add_member])
+                add_btn = gr.Button("Save payment")
+                add_status = gr.Textbox(label="Status", interactive=False)
+                applied_preview = gr.Dataframe(label="Applied (FIFO preview)", interactive=False)
+            add_direction.change(fn=_toggle_member_visibility, inputs=[add_direction], outputs=[add_member])
 
-        gr.Markdown("### Reconcile (build applications from existing payments)")
+        with gr.Column(visible=False) as reconcile_section:
+            gr.Markdown("### Reconcile (build applications from existing payments)")
 
-        reconcile_member_pick = gr.Dropdown(label="Member to reconcile", choices=_member_choice_list(), value=None)
-        reconcile_btn = gr.Button("Reconcile member (FIFO)")
-        reconcile_all_btn = gr.Button("Reconcile ALL members (FIFO)")
+            reconcile_member_pick = gr.Dropdown(label="Member to reconcile", choices=_member_choice_list(), value=None)
+            reconcile_btn = gr.Button("Reconcile member (FIFO)")
+            reconcile_all_btn = gr.Button("Reconcile ALL members (FIFO)")
 
-        reconcile_status = gr.Textbox(label="Reconcile status", interactive=False)
-        reconcile_table = gr.Dataframe(value=pd.DataFrame(), interactive=False)
+            reconcile_status = gr.Textbox(label="Reconcile status", interactive=False)
+            reconcile_table = gr.Dataframe(value=pd.DataFrame(), interactive=False)
 
-        reconcile_btn.click(fn=_reconcile_member, inputs=[reconcile_member_pick], outputs=[reconcile_status, reconcile_table])
-        reconcile_all_btn.click(fn=_reconcile_all, inputs=[], outputs=[reconcile_status, reconcile_table])
+            reconcile_btn.click(fn=_reconcile_member_guard, inputs=[current_role, reconcile_member_pick], outputs=[reconcile_status, reconcile_table])
+            reconcile_all_btn.click(fn=_reconcile_all_guard, inputs=[current_role], outputs=[reconcile_status, reconcile_table])
         # ---------------- Ledger controls ----------------
         gr.Markdown("### Payments ledger")
 
@@ -1036,41 +1183,40 @@ def ui_payments(demo):
             page = gr.Number(label="Page", value=1, precision=0)
             page_size = gr.Dropdown([10, 20, 30, 50, 100], value=30, label="Page size")
             refresh = gr.Button("🔄 Refresh")
+            clear_filters = gr.Button("🧹 Clear filters")
 
-        payments_table = gr.Dataframe(
-            value=_payments_page_df(1, 30, "All", None, None, ""),
-            interactive=False
-        )
+        payments_table = gr.Dataframe(value=pd.DataFrame(), interactive=False)
 
         # ---------------- Edit/Delete ----------------
-        gr.Markdown("### Edit / delete a payment")
+        with gr.Column(visible=False) as edit_delete_section:
+            gr.Markdown("### Edit / delete a payment")
 
-        payment_pick = gr.Dropdown(label="Select a payment to edit", choices=[], value=None)
-        load_btn = gr.Button("Load")
+            payment_pick = gr.Dropdown(label="Select a payment to edit", choices=[], value=None)
+            load_btn = gr.Button("Load")
 
-        selected_payment_id = gr.State(None)
+            selected_payment_id = gr.State(None)
 
-        with gr.Accordion("✏️ Edit selected payment", open=True):
-            edit_info = gr.Markdown("Pick a payment and click **Load**.")
+            with gr.Accordion("✏️ Edit selected payment", open=True):
+                edit_info = gr.Markdown("Pick a payment and click **Load**.")
 
-            with gr.Row():
-                edit_id = gr.Number(label="Payment ID", precision=0, interactive=False)
-                edit_when = gr.Textbox(label="Date (YYYY-MM-DD)")
-                edit_direction = gr.Dropdown(["INBOUND", "OUTBOUND"], label="Direction")
+                with gr.Row():
+                    edit_id = gr.Number(label="Payment ID", precision=0, interactive=False)
+                    edit_when = gr.Textbox(label="Date (YYYY-MM-DD)")
+                    edit_direction = gr.Dropdown(["INBOUND", "OUTBOUND"], label="Direction")
 
-            with gr.Row():
-                edit_member = gr.Dropdown(label="Member (required for INBOUND)", choices=[], value=None)
-                edit_invoice = gr.Dropdown(label="Linked invoice (optional)", choices=[], value=None)
+                with gr.Row():
+                    edit_member = gr.Dropdown(label="Member (required for INBOUND)", choices=[], value=None)
+                    edit_invoice = gr.Dropdown(label="Linked invoice (optional)", choices=[], value=None)
 
-            with gr.Row():
-                edit_amount = gr.Number(label="Amount")
-                edit_desc = gr.Textbox(label="Description")
+                with gr.Row():
+                    edit_amount = gr.Number(label="Amount")
+                    edit_desc = gr.Textbox(label="Description")
 
-            with gr.Row():
-                save_btn = gr.Button("💾 Save changes")
-                delete_btn = gr.Button("🗑️ Delete payment")
+                with gr.Row():
+                    save_btn = gr.Button("💾 Save changes")
+                    delete_btn = gr.Button("🗑️ Delete payment")
 
-            edit_status = gr.Textbox(label="Edit status", interactive=False)
+                edit_status = gr.Textbox(label="Edit status", interactive=False)
 
         edit_direction.change(fn=_toggle_member_visibility, inputs=[edit_direction], outputs=[edit_member])
 
@@ -1087,18 +1233,45 @@ def ui_payments(demo):
             inputs=[],
             outputs=[edit_member, edit_invoice, f_member, f_invoice, payment_pick],
         )
+        gr.on(
+            triggers=[demo.load],
+            fn=_payments_member_filter_update,
+            inputs=[current_role, current_member_id],
+            outputs=[f_member],
+        )
+        gr.on(
+            triggers=[demo.load],
+            fn=_payments_owner_controls_update,
+            inputs=[current_role],
+            outputs=[add_payment_section, reconcile_section, edit_delete_section],
+        )
+        current_role.change(
+            fn=_payments_owner_controls_update,
+            inputs=[current_role],
+            outputs=[add_payment_section, reconcile_section, edit_delete_section],
+        )
+        current_role.change(
+            fn=_payments_member_filter_update,
+            inputs=[current_role, current_member_id],
+            outputs=[f_member],
+        )
+        current_member_id.change(
+            fn=_payments_member_filter_update,
+            inputs=[current_role, current_member_id],
+            outputs=[f_member],
+        )
 
         # ---------------- Add payment handlers ----------------
         add_btn.click(
-            fn=_add_payment_v4,
-            inputs=[add_when, add_direction, add_member, add_invoice, add_amount, add_desc],
+            fn=_add_payment_guard,
+            inputs=[current_role, add_when, add_direction, add_member, add_invoice, add_amount, add_desc],
             outputs=[add_status,applied_preview],
         )
 
         # Refresh table + payment dropdown after adding
         add_btn.click(
             fn=_payments_page_df,
-            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search],
+            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search, current_role, current_member_id],
             outputs=[payments_table],
         )
         add_btn.click(
@@ -1110,16 +1283,21 @@ def ui_payments(demo):
         # ---------------- Refresh handlers ----------------
         refresh.click(
             fn=_payments_page_df,
-            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search],
+            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search, current_role, current_member_id],
             outputs=[payments_table],
         )
         refresh.click(fn=_payment_pick_update, inputs=[], outputs=[payment_pick])
+        clear_filters.click(
+            fn=_clear_payment_filters,
+            inputs=[current_role, current_member_id, page_size],
+            outputs=[f_dir, f_member, f_invoice, f_search, page, payments_table],
+        )
 
         # Auto refresh on filters/pagination
         for c in (f_dir, f_member, f_invoice, f_search, page, page_size):
             c.change(
                 fn=_payments_page_df,
-                inputs=[page, page_size, f_dir, f_member, f_invoice, f_search],
+                inputs=[page, page_size, f_dir, f_member, f_invoice, f_search, current_role, current_member_id],
                 outputs=[payments_table],
             )
 
@@ -1132,26 +1310,32 @@ def ui_payments(demo):
 
         # ---------------- Save edits ----------------
         save_btn.click(
-            fn=_save_payment_edits_v4,
-            inputs=[selected_payment_id, edit_when, edit_direction, edit_member, edit_invoice, edit_amount, edit_desc],
+            fn=_save_payment_guard,
+            inputs=[current_role, selected_payment_id, edit_when, edit_direction, edit_member, edit_invoice, edit_amount, edit_desc],
             outputs=[edit_status],
         )
         save_btn.click(
             fn=_payments_page_df,
-            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search],
+            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search, current_role, current_member_id],
             outputs=[payments_table],
         )
         save_btn.click(fn=_payment_pick_update, inputs=[], outputs=[payment_pick])
 
         # ---------------- Delete payment ----------------
         delete_btn.click(
-            fn=_delete_payment_v4,
-            inputs=[selected_payment_id],
+            fn=_delete_payment_guard,
+            inputs=[current_role, selected_payment_id],
             outputs=[edit_status, selected_payment_id, edit_info, edit_id, edit_when, edit_direction, edit_member, edit_invoice, edit_amount, edit_desc],
         )
         delete_btn.click(
             fn=_payments_page_df,
-            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search],
+            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search, current_role, current_member_id],
+            outputs=[payments_table],
+        )
+        gr.on(
+            triggers=[demo.load],
+            fn=_payments_page_df,
+            inputs=[page, page_size, f_dir, f_member, f_invoice, f_search, current_role, current_member_id],
             outputs=[payments_table],
         )
         delete_btn.click(fn=_payment_pick_update, inputs=[], outputs=[payment_pick])
@@ -1160,17 +1344,27 @@ def ui_payments(demo):
 
 
 
-def _reminder_logs_df(limit=50, member_filter=None, success_filter="All"):
+def _reminder_logs_df(limit=50, member_filter=None, success_filter="All", current_role=None, forced_member_id=None):
     """
     success_filter: "All" | "Success" | "Failed"
     member_filter: "id | Name" or None
     """
+    role = (current_role or "").strip().upper()
     member_id = None
-    if member_filter:
-        try:
-            member_id = int(str(member_filter).split("|")[0].strip())
-        except Exception:
-            member_id = None
+
+    # Enforce member-scoped access server-side (UI visibility alone is not a security boundary).
+    if role == "MEMBER":
+        if forced_member_id is not None:
+            try:
+                member_id = int(forced_member_id)
+            except Exception:
+                member_id = None
+    else:
+        if member_filter:
+            try:
+                member_id = int(str(member_filter).split("|")[0].strip())
+            except Exception:
+                member_id = None
 
     with SessionLocal() as db:
         q = (
@@ -1217,7 +1411,7 @@ def _reminder_member_filter_choices():
         rows = db.execute(select(Member.id, Member.name).order_by(Member.name)).all()
     return [f"{r.id} | {r.name}" for r in rows if r.name and str(r.name).strip().lower() != "nan"]
 
-def ui_reminders():
+def ui_reminders(current_role, current_member_id):
     with gr.Column():
         gr.Markdown("## Reminder Logs")
 
@@ -1239,36 +1433,97 @@ def ui_reminders():
             refresh = gr.Button("🔄 Refresh")
             clear_filter = gr.Button("🧹 Clear filters")
 
-        logs_table = gr.Dataframe(value=_reminder_logs_df(), interactive=False)
+        logs_table = gr.Dataframe(value=pd.DataFrame(), interactive=False)
+
+        def _init_reminders_view(role, member_id):
+            role = (role or "").strip().upper()
+            if role == "MEMBER" and member_id is not None:
+                return (
+                    gr.update(choices=[], value=None, visible=False),
+                    _reminder_logs_df(50, None, "All", role, member_id),
+                )
+            return (
+                gr.update(choices=_reminder_member_filter_choices(), value=None, visible=True),
+                _reminder_logs_df(50, None, "All", role, None),
+            )
 
         # Refresh button
         refresh.click(
             fn=_reminder_logs_df,
-            inputs=[limit, member_filter, success_filter],
+            inputs=[limit, member_filter, success_filter, current_role, current_member_id],
             outputs=[logs_table],
         )
 
         # Filter changes auto-refresh
-        member_filter.change(fn=_reminder_logs_df, inputs=[limit, member_filter, success_filter], outputs=[logs_table])
-        success_filter.change(fn=_reminder_logs_df, inputs=[limit, member_filter, success_filter], outputs=[logs_table])
-        limit.change(fn=_reminder_logs_df, inputs=[limit, member_filter, success_filter], outputs=[logs_table])
+        member_filter.change(fn=_reminder_logs_df, inputs=[limit, member_filter, success_filter, current_role, current_member_id], outputs=[logs_table])
+        success_filter.change(fn=_reminder_logs_df, inputs=[limit, member_filter, success_filter, current_role, current_member_id], outputs=[logs_table])
+        limit.change(fn=_reminder_logs_df, inputs=[limit, member_filter, success_filter, current_role, current_member_id], outputs=[logs_table])
 
-        def _clear():
-            return None, "All", 50, _reminder_logs_df(50, None, "All")
+        def _clear(role, member_id):
+            return gr.update(value=None), "All", 50, _reminder_logs_df(50, None, "All", role, member_id)
 
-        clear_filter.click(fn=_clear, inputs=[], outputs=[member_filter, success_filter, limit, logs_table])
+        clear_filter.click(fn=_clear, inputs=[current_role, current_member_id], outputs=[member_filter, success_filter, limit, logs_table])
+        current_role.change(fn=_init_reminders_view, inputs=[current_role, current_member_id], outputs=[member_filter, logs_table])
+        current_member_id.change(fn=_init_reminders_view, inputs=[current_role, current_member_id], outputs=[member_filter, logs_table])
 
 
 
 MONTH_NUM = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
              "Jul": 7, "Aug": 8, "Sept": 9, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
 
-def ui_applications(demo):
+def _member_choice_from_id(member_id):
+    if member_id is None:
+        return None
+    with SessionLocal() as db:
+        m = db.get(Member, int(member_id))
+        if not m:
+            return None
+    return f"{m.id} | {m.name}"
+
+
+def _init_applications_view(role, member_id):
+    role = (role or "").strip().upper()
+
+    if role == "MEMBER" and member_id is not None:
+        val = _member_choice_from_id(member_id)
+        return (
+            gr.update(choices=[val] if val else [], value=val, visible=False),   # member_pick
+            gr.update(visible=False),                                             # refresh_members
+            _member_credit(val),
+            _member_applications_by_invoice_df(val),
+            _member_application_rows_df(val),
+        )
+
+    choices = _member_choice_list()
+    first_val = choices[0] if choices else None
+    return (
+        gr.update(choices=choices, value=first_val, visible=True),               # member_pick
+        gr.update(visible=True),                                                 # refresh_members
+        _member_credit(first_val) if first_val else "",
+        _member_applications_by_invoice_df(first_val) if first_val else pd.DataFrame(),
+        _member_application_rows_df(first_val) if first_val else pd.DataFrame(),
+    )
+
+
+def _refresh_member_choices_for_role(role, member_id):
+    role = (role or "").strip().upper()
+
+    if role == "MEMBER" and member_id is not None:
+        val = _member_choice_from_id(member_id)
+        return gr.update(choices=[val] if val else [], value=val, visible=False)
+
+    choices = _member_choice_list()
+    return gr.update(choices=choices, value=(choices[0] if choices else None), visible=True)
+
+
+def ui_applications(demo, current_role, current_member_id):
     with gr.Column():
         gr.Markdown("## Payment Applications (verify allocations)")
 
-        member_pick = gr.Dropdown(label="Member", choices=[], value=None)
-        refresh_members = gr.Button("🔄 Refresh members")
+        # Start hidden to avoid first-render flash for MEMBER users;
+        # role-aware init will show these for non-member roles.
+        member_pick = gr.Dropdown(label="Member", choices=[], value=None, visible=False)
+        refresh_members = gr.Button("🔄 Refresh members", visible=False)
 
         credit_box = gr.Textbox(label="Unapplied credit", interactive=False)
 
@@ -1280,21 +1535,52 @@ def ui_applications(demo):
 
         refresh = gr.Button("🔄 Refresh tables")
 
-        def _load_members():
-            return gr.update(choices=_member_choice_list(), value=None)
+        def _refresh_all(role, forced_member_id, mpick):
+            role = (role or "").strip().upper()
+            if role == "MEMBER" and forced_member_id is not None:
+                mpick = _member_choice_from_id(forced_member_id)
 
-        refresh_members.click(fn=_load_members, inputs=[], outputs=[member_pick])
-        gr.on(triggers=[demo.load], fn=_load_members, inputs=[], outputs=[member_pick])
-
-        def _refresh_all(mpick):
             return (
                 _member_credit(mpick),
                 _member_applications_by_invoice_df(mpick),
                 _member_application_rows_df(mpick),
             )
 
-        refresh.click(fn=_refresh_all, inputs=[member_pick], outputs=[credit_box, by_invoice, app_rows])
-        member_pick.change(fn=_refresh_all, inputs=[member_pick], outputs=[credit_box, by_invoice, app_rows])
+        # Role-aware member refresh
+        refresh_members.click(
+            fn=_refresh_member_choices_for_role,
+            inputs=[current_role, current_member_id],
+            outputs=[member_pick],
+        )
+
+        # Main initialization on app load / refresh
+        demo.load(
+            fn=_init_applications_view,
+            inputs=[current_role, current_member_id],
+            outputs=[member_pick, refresh_members, credit_box, by_invoice, app_rows],
+        )
+        current_role.change(
+            fn=_init_applications_view,
+            inputs=[current_role, current_member_id],
+            outputs=[member_pick, refresh_members, credit_box, by_invoice, app_rows],
+        )
+        current_member_id.change(
+            fn=_init_applications_view,
+            inputs=[current_role, current_member_id],
+            outputs=[member_pick, refresh_members, credit_box, by_invoice, app_rows],
+        )
+
+        refresh.click(
+        fn=_refresh_all,
+        inputs=[current_role, current_member_id, member_pick],
+        outputs=[credit_box, by_invoice, app_rows],
+        )
+
+    member_pick.change(
+        fn=_refresh_all,
+        inputs=[current_role, current_member_id, member_pick],
+        outputs=[credit_box, by_invoice, app_rows],
+    )
 
 def _invoice_month_case():
     return case({k: v for k, v in MONTH_NUM.items()}, value=Invoice.month, else_=99)
