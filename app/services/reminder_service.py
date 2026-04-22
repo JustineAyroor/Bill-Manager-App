@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+import re
+from typing import Iterable, List, Optional
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
@@ -10,19 +11,26 @@ from sqlalchemy import select, func
 from app.services.accounting import member_balances
 from app.db.models import Member, ReminderLog
 
+REMINDER_CHANNELS = ("EMAIL", "SMS", "WHATSAPP")
+PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+
 
 @dataclass
 class ReminderPolicy:
     owner_name: str = "Justine"
     min_balance: float = 10.0
     cooldown_days: int = 7
+    cooldown_minutes: int | None = None
 
 
 @dataclass
 class ReminderCandidate:
     member_id: int
     member: str
+    channel: str
+    recipient: str
     email: str
+    phone: str
     balance: float
     last_reminder_at: Optional[datetime]
     eligible: bool
@@ -39,22 +47,79 @@ def _looks_like_email(s: str) -> bool:
     return True
 
 
-def last_reminder_map(db: Session) -> dict[int, datetime]:
+def _looks_like_phone(s: str) -> bool:
+    return bool(PHONE_RE.match((s or "").strip()))
+
+
+def normalize_reminder_channels(channels: Iterable[str] | None = None) -> list[str]:
+    if channels is None:
+        return ["EMAIL"]
+
+    out = []
+    for channel in channels:
+        value = str(channel or "").strip().upper()
+        if value in REMINDER_CHANNELS and value not in out:
+            out.append(value)
+    return out or ["EMAIL"]
+
+
+def last_reminder_map(db: Session, channels: Iterable[str] | None = None) -> dict[tuple[int, str], datetime]:
+    selected_channels = normalize_reminder_channels(channels)
     rows = db.execute(
-        select(ReminderLog.member_id, func.max(ReminderLog.created_at))
-        .group_by(ReminderLog.member_id)
+        select(ReminderLog.member_id, ReminderLog.channel, func.max(ReminderLog.created_at))
+        .where(ReminderLog.channel.in_(selected_channels))
+        .group_by(ReminderLog.member_id, ReminderLog.channel)
     ).all()
-    return {int(r[0]): r[1] for r in rows if r[0] is not None and r[1] is not None}
+    return {
+        (int(member_id), str(channel or "EMAIL").upper()): last_at
+        for member_id, channel, last_at in rows
+        if member_id is not None and last_at is not None
+    }
 
 
-def compute_reminder_candidates(db: Session, policy: ReminderPolicy) -> List[ReminderCandidate]:
+def compute_reminder_candidates(
+    db: Session,
+    policy: ReminderPolicy,
+    channels: Iterable[str] | None = None,
+) -> List[ReminderCandidate]:
+    selected_channels = normalize_reminder_channels(channels)
     balances = member_balances(db)
 
-    member_rows = db.execute(select(Member.id, Member.email, Member.name)).all()
-    email_map = {int(mid): (str(email or "").strip(), str(name or "").strip()) for (mid, email, name) in member_rows}
+    member_rows = db.execute(
+        select(
+            Member.id,
+            Member.email,
+            Member.phone,
+            Member.name,
+            Member.email_enabled,
+            Member.sms_enabled,
+            Member.whatsapp_enabled,
+        )
+    ).all()
+    contact_map = {
+        int(mid): {
+            "email": str(email or "").strip(),
+            "phone": str(phone or "").strip(),
+            "name": str(name or "").strip(),
+            "email_enabled": bool(email_enabled),
+            "sms_enabled": bool(sms_enabled),
+            "whatsapp_enabled": bool(whatsapp_enabled),
+        }
+        for (mid, email, phone, name, email_enabled, sms_enabled, whatsapp_enabled) in member_rows
+    }
 
-    last_map = last_reminder_map(db)
+    last_map = last_reminder_map(db, selected_channels)
     now = datetime.now()
+    cooldown = (
+        timedelta(minutes=policy.cooldown_minutes)
+        if policy.cooldown_minutes is not None
+        else timedelta(days=policy.cooldown_days)
+    )
+    cooldown_label = (
+        f"{policy.cooldown_minutes}m"
+        if policy.cooldown_minutes is not None
+        else f"{policy.cooldown_days}d"
+    )
 
     out: List[ReminderCandidate] = []
 
@@ -63,53 +128,97 @@ def compute_reminder_candidates(db: Session, policy: ReminderPolicy) -> List[Rem
         name = str(b["member"] or "").strip()
         balance = float(b["balance"] or 0.0)
 
-        email, _ = email_map.get(member_id, ("", ""))
+        info = contact_map.get(
+            member_id,
+            {
+                "email": "",
+                "phone": "",
+                "name": "",
+                "email_enabled": False,
+                "sms_enabled": False,
+                "whatsapp_enabled": False,
+            },
+        )
+        email = str(info["email"])
+        phone = str(info["phone"])
 
         # Skip junk names
         if not name or name.lower() == "nan":
             continue
 
-        # Owner excluded
-        if name.lower() == policy.owner_name.strip().lower():
-            out.append(ReminderCandidate(member_id, name, email, balance, last_map.get(member_id), False, "Owner excluded"))
-            continue
+        for channel in selected_channels:
+            last_at = last_map.get((member_id, channel))
+            recipient = email if channel == "EMAIL" else phone
+            base_args = {
+                "member_id": member_id,
+                "member": name,
+                "channel": channel,
+                "recipient": recipient,
+                "email": email,
+                "phone": phone,
+                "balance": balance,
+                "last_reminder_at": last_at,
+            }
 
-        # Nothing owed
-        if balance <= 0:
-            out.append(ReminderCandidate(member_id, name, email, balance, last_map.get(member_id), False, "Nothing owed"))
-            continue
+            # Owner excluded
+            if name.lower() == policy.owner_name.strip().lower():
+                out.append(ReminderCandidate(**base_args, eligible=False, reason="Owner excluded"))
+                continue
 
-        # Threshold
-        if balance < policy.min_balance:
-            out.append(ReminderCandidate(member_id, name, email, balance, last_map.get(member_id), False, f"Below min (${policy.min_balance:.2f})"))
-            continue
+            # Nothing owed
+            if balance <= 0:
+                out.append(ReminderCandidate(**base_args, eligible=False, reason="Nothing owed"))
+                continue
 
-        # Email checks
-        if not email:
-            out.append(ReminderCandidate(member_id, name, "", balance, last_map.get(member_id), False, "Missing email"))
-            continue
+            # Threshold
+            if balance < policy.min_balance:
+                out.append(ReminderCandidate(**base_args, eligible=False, reason=f"Below min (${policy.min_balance:.2f})"))
+                continue
 
-        if not _looks_like_email(email):
-            out.append(ReminderCandidate(member_id, name, email, balance, last_map.get(member_id), False, "Invalid email format"))
-            continue
+            if channel == "EMAIL":
+                if not bool(info["email_enabled"]):
+                    out.append(ReminderCandidate(**base_args, eligible=False, reason="Email disabled"))
+                    continue
+                if not email:
+                    out.append(ReminderCandidate(**base_args, eligible=False, reason="Missing email"))
+                    continue
+                if not _looks_like_email(email):
+                    out.append(ReminderCandidate(**base_args, eligible=False, reason="Invalid email format"))
+                    continue
+            else:
+                if channel == "SMS" and not bool(info["sms_enabled"]):
+                    out.append(ReminderCandidate(**base_args, eligible=False, reason="SMS disabled"))
+                    continue
+                if channel == "WHATSAPP" and not bool(info["whatsapp_enabled"]):
+                    out.append(ReminderCandidate(**base_args, eligible=False, reason="WhatsApp disabled"))
+                    continue
+                if not phone:
+                    out.append(ReminderCandidate(**base_args, eligible=False, reason="Missing phone"))
+                    continue
+                if not _looks_like_phone(phone):
+                    out.append(ReminderCandidate(**base_args, eligible=False, reason="Phone must be E.164, e.g. +15551234567"))
+                    continue
 
-        # Cooldown
-        last_at = last_map.get(member_id)
-        if last_at and (now - last_at) < timedelta(days=policy.cooldown_days):
-            out.append(ReminderCandidate(member_id, name, email, balance, last_at, False, f"Cooldown ({policy.cooldown_days}d)"))
-            continue
+            # Cooldown
+            if last_at and (now - last_at) < cooldown:
+                out.append(ReminderCandidate(**base_args, eligible=False, reason=f"Cooldown ({cooldown_label})"))
+                continue
 
-        out.append(ReminderCandidate(member_id, name, email, balance, last_at, True, "Eligible"))
+            out.append(ReminderCandidate(**base_args, eligible=True, reason="Eligible"))
 
     # Eligible first, then biggest balances
-    out.sort(key=lambda x: (not x.eligible, -x.balance, x.member.lower()))
+    out.sort(key=lambda x: (not x.eligible, x.channel, -x.balance, x.member.lower()))
     return out
 
 
-def get_eligible_reminder_candidates(db: Session, policy: ReminderPolicy) -> List[ReminderCandidate]:
-    return [c for c in compute_reminder_candidates(db, policy) if c.eligible]
+def get_eligible_reminder_candidates(
+    db: Session,
+    policy: ReminderPolicy,
+    channels: Iterable[str] | None = None,
+) -> List[ReminderCandidate]:
+    return [c for c in compute_reminder_candidates(db, policy, channels) if c.eligible]
 
-def build_reminder_email(member_name: str, balance: float) -> tuple[str, str, str]:
+def build_reminder_message(member_name: str, balance: float) -> tuple[str, str, str]:
     subject = "T-Mobile plan payment reminder"
 
     text = (
@@ -153,3 +262,7 @@ def build_reminder_email(member_name: str, balance: float) -> tuple[str, str, st
     </div>
     """
     return subject, text, html
+
+
+def build_reminder_email(member_name: str, balance: float) -> tuple[str, str, str]:
+    return build_reminder_message(member_name, balance)

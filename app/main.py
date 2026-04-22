@@ -1,8 +1,11 @@
 import os
+import asyncio
 import gradio as gr
 from app.ui.screens import ui_dashboard, ui_members, ui_invoices, ui_payments, ui_reminders, ui_applications
 from app.ui.bill_import import ui_bill_import
-from app.auth.service import authenticate_user
+from app.auth.service import authenticate_user, request_password_reset, reset_password_with_code
+from app.services.account_email_templates import build_password_reset_email
+from app.services.email_service import send_email
 
 _BROWSER_STATE_KEY = "tmobile_bill_manager_user"
 _BROWSER_STATE_SECRET = os.environ.get(
@@ -78,6 +81,30 @@ def login_user(email, password):
         user.member_id,
     )
 
+
+def send_password_reset_email(email):
+    result = request_password_reset(email)
+    if not result.ok or not result.user_email or not result.reset_code:
+        return result.message
+
+    subject, text_body, html_body = build_password_reset_email(
+        result.user_email,
+        result.reset_code,
+        result.expires_minutes,
+    )
+    try:
+        asyncio.run(send_email(result.user_email, subject, text_body, html_body))
+        return f"Reset code sent to {result.user_email}."
+    except Exception as exc:
+        return f"Reset code created, but email could not be sent: {exc}"
+
+
+def complete_password_reset(email, reset_code, new_password, confirm_password):
+    result = reset_password_with_code(email, reset_code, new_password, confirm_password)
+    if result == "Password reset complete.":
+        return result, "", "", "", ""
+    return result, email, reset_code, new_password, confirm_password
+
 def logout_user():
     return (
         _empty_session(),
@@ -104,7 +131,7 @@ def apply_role_visibility(role):
 
     return (
         gr.update(visible=is_owner or is_member),  # dashboard_panel
-        gr.update(visible=is_owner),               # members_panel
+        gr.update(visible=is_owner or is_member),  # members_panel
         gr.update(visible=is_owner or is_member),  # invoices_panel
         gr.update(visible=is_owner or is_member),  # payments_panel
         gr.update(visible=is_owner or is_member),  # reminders_panel
@@ -131,6 +158,16 @@ def build_app():
             password = gr.Textbox(label="Password", type="password")
             login_btn = gr.Button("Login")
             login_status = gr.Textbox(label="Status", interactive=False)
+            gr.Markdown("### Forgot password")
+            forgot_email = gr.Textbox(label="Account email")
+            forgot_btn = gr.Button("Email reset code")
+            forgot_status = gr.Textbox(label="Reset email status", interactive=False)
+            reset_email = gr.Textbox(label="Reset email")
+            reset_code = gr.Textbox(label="Reset code")
+            reset_new_password = gr.Textbox(label="New password", type="password")
+            reset_confirm_password = gr.Textbox(label="Confirm new password", type="password")
+            reset_btn = gr.Button("Reset password")
+            reset_status = gr.Textbox(label="Reset status", interactive=False)
 
         with gr.Column(visible=False) as app_panel:
             logout_btn = gr.Button("Logout")
@@ -142,11 +179,11 @@ def build_app():
 
                 with gr.Tab("Members"):
                     with gr.Column() as members_panel:
-                        ui_members(demo)
+                        ui_members(demo, current_role, current_member_id, current_user, login_status, login_panel, app_panel)
 
                 with gr.Tab("Invoices & Allocations"):
                     with gr.Column() as invoices_panel:
-                        ui_invoices(demo, current_role)
+                        ui_invoices(demo, current_role, current_member_id)
 
                 with gr.Tab("Payments"):
                     with gr.Column() as payments_panel:
@@ -184,6 +221,18 @@ def build_app():
                 applications_panel,
                 bill_import_panel,
             ],
+        )
+
+        forgot_btn.click(
+            fn=send_password_reset_email,
+            inputs=[forgot_email],
+            outputs=[forgot_status],
+        )
+
+        reset_btn.click(
+            fn=complete_password_reset,
+            inputs=[reset_email, reset_code, reset_new_password, reset_confirm_password],
+            outputs=[reset_status, reset_email, reset_code, reset_new_password, reset_confirm_password],
         )
 
         logout_btn.click(

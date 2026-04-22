@@ -12,6 +12,9 @@ class Member(Base):
     email = Column(String, nullable=True)
     phone = Column(String, nullable=True)
     is_active = Column(Integer, default=1, nullable=False)  # 1/0
+    email_enabled = Column(Boolean, default=True, nullable=False)
+    sms_enabled = Column(Boolean, default=False, nullable=False)
+    whatsapp_enabled = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     phone_last4 = Column(String, nullable=True)
 
@@ -74,14 +77,24 @@ class ReminderLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     member_id = Column(Integer, ForeignKey("members.id"), nullable=False)
-    email = Column(String, nullable=False)
+    channel = Column(String, default="EMAIL", nullable=False)  # EMAIL | SMS | WHATSAPP
+    recipient = Column(String, nullable=True)
+    sender = Column(String, nullable=True)
+
+    # Kept for compatibility with existing email reminder code/log views.
+    email = Column(String, nullable=True)
 
     amount = Column(Float, nullable=False)  # outstanding at time of send
-    subject = Column(String, nullable=False)
+    subject = Column(String, nullable=True)
     body = Column(String, nullable=False)
+
+    provider = Column(String, nullable=True)  # SMTP | TWILIO
+    provider_message_id = Column(String, nullable=True)
+    provider_status = Column(String, nullable=True)
 
     success = Column(Integer, default=1, nullable=False)  # 1/0
     error = Column(String, nullable=True)
+    error_code = Column(String, nullable=True)
     status = Column(String, nullable=True)
 
     member = relationship("Member")
@@ -112,6 +125,11 @@ class User(Base):
     role = Column(String, default="OWNER", nullable=False)   # OWNER for now
     is_active = Column(Boolean, default=True, nullable=False)
     member_id = Column(Integer, ForeignKey("members.id"), nullable=True)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    invite_sent_at = Column(DateTime(timezone=True), nullable=True)
+    password_reset_token = Column(String, nullable=True)
+    password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
+    password_reset_sent_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     member = relationship("Member")

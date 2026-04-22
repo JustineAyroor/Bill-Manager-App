@@ -11,11 +11,22 @@ from app.services import crud
 from app.services.accounting import member_balances, plan_totals
 from app.services.excel_io import export_excel
 from sqlalchemy import select,case,func
-from app.db.models import Payment, Member,Invoice,Allocation, ReminderLog,PaymentApplication
+from app.db.models import Payment, Member,Invoice,Allocation, ReminderLog,PaymentApplication, User
 from app.services.recompute_owner import recompute_owner_allocation
-from app.services.reminder_service import compute_reminder_candidates, build_reminder_email, get_eligible_reminder_candidates,ReminderPolicy
+from app.services.reminder_service import (
+    REMINDER_CHANNELS,
+    ReminderPolicy,
+    build_reminder_message,
+    compute_reminder_candidates,
+    get_eligible_reminder_candidates,
+    normalize_reminder_channels,
+)
+from app.services.reminder_sender import send_reminder
+from app.services.account_email_templates import build_member_invite_email
+from app.services.twilio_service import fetch_message_status
 from app.services.email_service import send_email
 from app.services.payment_apply import auto_apply_payment_fifo
+from app.auth.service import change_user_password, ensure_member_user_for_member, mark_invite_sent
 import re
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -24,18 +35,22 @@ def _valid_email(s: str) -> bool:
 
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sept","Oct","Nov","Dec"]
 
-def _preview_reminders_df():
+def _preview_reminders_df(channels=None):
 
-    policy = ReminderPolicy(owner_name="Justine", min_balance=10.0, cooldown_days=7)
+    policy = ReminderPolicy(owner_name="Justine", min_balance=10.0, cooldown_minutes=5)
+    selected_channels = normalize_reminder_channels(channels)
 
     with SessionLocal() as db:
-        candidates = compute_reminder_candidates(db, policy)
+        candidates = compute_reminder_candidates(db, policy, selected_channels)
 
     rows = []
     for c in candidates:
         rows.append({
             "member": c.member,
+            "channel": c.channel,
+            "recipient": c.recipient,
             "email": c.email,
+            "phone": c.phone,
             "balance": round(float(c.balance), 2),
             "eligible": "YES" if c.eligible else "NO",
             "reason": c.reason,
@@ -44,25 +59,30 @@ def _preview_reminders_df():
 
     return pd.DataFrame(rows)
 
-def _send_reminders_now():
+def _send_reminders_now(channels=None):
 
-    policy = ReminderPolicy(owner_name="Justine", min_balance=10.0, cooldown_days=7)
+    policy = ReminderPolicy(owner_name="Justine", min_balance=10.0, cooldown_minutes=5)
+    selected_channels = normalize_reminder_channels(channels)
 
     with SessionLocal() as db:
-        candidates = get_eligible_reminder_candidates(db, policy)
+        candidates = get_eligible_reminder_candidates(db, policy, selected_channels)
 
     if not candidates:
-        return "No eligible reminders to send (threshold/cooldown/email rules).", _preview_reminders_df()
+        return "No eligible reminders to send for the selected channel(s).", _preview_reminders_df(selected_channels)
 
     async def _send_all():
         results = []
         for c in candidates:
-            subject, text_body, html_body = build_reminder_email(c.member, c.balance)
-            try:
-                await send_email(c.email, subject, text_body, html_body)
-                results.append((c, subject, html_body, 1, None, "QUEUED"))
-            except Exception as e:
-                results.append((c, subject, html_body, 0, str(e), "FAILED"))
+            subject, text_body, html_body = build_reminder_message(c.member, c.balance)
+            result = await send_reminder(
+                channel=c.channel,
+                recipient=c.recipient,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+            )
+            body = html_body if c.channel == "EMAIL" else text_body
+            results.append((c, subject, body, result))
         return results
 
     results = asyncio.run(_send_all())
@@ -71,30 +91,37 @@ def _send_reminders_now():
     failures = []
 
     with SessionLocal() as db:
-        for c, subject, body, success, err, status in results:
-            if success == 1:
+        for c, subject, body, result in results:
+            if result.success:
                 sent += 1
             else:
-                failures.append(f"{c.member} ({c.email}): {err}")
+                failures.append(f"{c.member} [{c.channel}] ({c.recipient}): {result.error}")
 
             db.add(ReminderLog(
                 member_id=c.member_id,
+                channel=c.channel,
+                recipient=result.recipient or c.recipient,
+                sender=result.sender,
                 email=c.email,
                 amount=float(c.balance),
-                subject=subject,
+                subject=subject if c.channel == "EMAIL" else None,
                 body=body,          # store html (or store both if you add another column)
-                success=int(success),
-                error=err,
-                status=status,
+                provider=result.provider,
+                provider_message_id=result.provider_message_id,
+                provider_status=result.provider_status,
+                success=int(result.success),
+                error=result.error,
+                error_code=result.error_code,
+                status=result.provider_status,
             ))
         db.commit()
 
     if failures:
         msg = f"Sent {sent} reminders. Failures:\n" + "\n".join(failures[:10])
     else:
-        msg = f"✅ Queued {sent} reminder emails."
+        msg = f"Queued {sent} reminder(s)."
 
-    return msg, _preview_reminders_df()
+    return msg, _preview_reminders_df(selected_channels)
 
 # def _send_reminders_now():
 #     # Step 1: read candidates (sync DB)
@@ -272,17 +299,17 @@ def ui_dashboard(demo,current_role, current_member_id):
         role = (role or "").strip().upper()
         return gr.update(visible=(role == "OWNER"))
 
-    def _preview_reminders_for_role(role):
+    def _preview_reminders_for_role(role, channels):
         role = (role or "").strip().upper()
-        if role == "MEMBER":
+        if role != "OWNER":
             return pd.DataFrame()
-        return _preview_reminders_df()
+        return _preview_reminders_df(channels)
 
-    def _send_reminders_for_role(role):
+    def _send_reminders_for_role(role, channels):
         role = (role or "").strip().upper()
-        if role == "MEMBER":
+        if role != "OWNER":
             return "Not allowed for MEMBER role.", pd.DataFrame()
-        return _send_reminders_now()
+        return _send_reminders_now(channels)
 
     with gr.Column():
         gr.Markdown("## Dashboard — Who owes what")
@@ -322,7 +349,12 @@ def ui_dashboard(demo,current_role, current_member_id):
                 export_btn.click(fn=_export_click, inputs=[], outputs=[export_file])
 
                 with gr.Column(visible=False) as reminders_panel:
-                    gr.Markdown("### Email reminders")
+                    gr.Markdown("### Send reminders")
+                    reminder_channels = gr.CheckboxGroup(
+                        label="Channels",
+                        choices=list(REMINDER_CHANNELS),
+                        value=["EMAIL"],
+                    )
 
                     with gr.Row():
                         preview_btn = gr.Button("👀 Preview")
@@ -331,8 +363,8 @@ def ui_dashboard(demo,current_role, current_member_id):
                     send_status = gr.Textbox(label="Status", interactive=False)
                     preview_table = gr.Dataframe(value=pd.DataFrame(), interactive=False)
 
-                    preview_btn.click(fn=_preview_reminders_for_role, inputs=[current_role], outputs=[preview_table])
-                    send_btn.click(fn=_send_reminders_for_role, inputs=[current_role], outputs=[send_status, preview_table])
+                    preview_btn.click(fn=_preview_reminders_for_role, inputs=[current_role, reminder_channels], outputs=[preview_table])
+                    send_btn.click(fn=_send_reminders_for_role, inputs=[current_role, reminder_channels], outputs=[send_status, preview_table])
 
         # --- Bottom: Table + Refresh controls ---
         gr.Markdown("### Balances table")
@@ -348,7 +380,7 @@ def ui_dashboard(demo,current_role, current_member_id):
         refresh_all.click(fn=_balances_chart_plotly, inputs=[current_role, current_member_id, show_only_owed, sort_by], outputs=[chart])
         refresh_all.click(fn=_df_balances, inputs=[current_role, current_member_id], outputs=[balances])
         refresh_all.click(fn=_plan_totals_html, inputs=[], outputs=[totals_html])
-        refresh_all.click(fn=_preview_reminders_for_role, inputs=[current_role], outputs=[preview_table])
+        refresh_all.click(fn=_preview_reminders_for_role, inputs=[current_role, reminder_channels], outputs=[preview_table])
 
         # Optional: initial load refresh (ensures the dashboard starts consistent)
         gr.on(
@@ -370,7 +402,7 @@ def ui_dashboard(demo,current_role, current_member_id):
         )
         gr.on(triggers=[demo.load], fn=_df_balances, inputs=[current_role, current_member_id], outputs=[balances])
         gr.on(triggers=[demo.load], fn=_plan_totals_html, inputs=[], outputs=[totals_html])
-        gr.on(triggers=[demo.load], fn=_preview_reminders_for_role, inputs=[current_role], outputs=[preview_table])
+        gr.on(triggers=[demo.load], fn=_preview_reminders_for_role, inputs=[current_role, reminder_channels], outputs=[preview_table])
 
     return
 
@@ -457,35 +489,165 @@ def _balances_chart_plotly(role="", member_id=None,show_only_owed: bool = False,
 
     return fig
   
-def ui_members(demo):
+def ui_members(demo, current_role, current_member_id, current_user, login_status, login_panel, app_panel):
     with gr.Column():
         gr.Markdown("## Members")
+        with gr.Column(visible=False) as owner_members_panel:
+            with gr.Row():
+                member_pick = gr.Dropdown(label="Select member", choices=[], value=None)
+                refresh = gr.Button("🔄 Refresh")
 
-        member_pick = gr.Dropdown(label="Select member to edit", choices=[], value=None)
-        refresh = gr.Button("🔄 Refresh list")
+            gr.Markdown("### Member details")
+            name = gr.Textbox(label="Name")
+            email = gr.Textbox(label="Email")
+            phone = gr.Textbox(label="Phone")
+            is_active = gr.Checkbox(label="Active", value=True)
 
-        name = gr.Textbox(label="Name")
-        email = gr.Textbox(label="Email (optional)")
-        phone = gr.Textbox(label="Phone (optional)")
-        is_active = gr.Checkbox(label="Active", value=True)
+            gr.Markdown("### Reminder preferences")
+            email_enabled = gr.Checkbox(label="Allow email reminders", value=True)
+            sms_enabled = gr.Checkbox(label="Allow SMS reminders", value=False)
+            whatsapp_enabled = gr.Checkbox(label="Allow WhatsApp reminders", value=False)
 
-        save_btn = gr.Button("Save (create or update)")
-        out = gr.Textbox(label="Result", interactive=False)
-        table = gr.Dataframe(value=_members_df(), interactive=False)
+            gr.Markdown("### Member account")
+            current_linked_login = gr.Textbox(label="Member login account", interactive=False)
+            send_invite_email = gr.Checkbox(label="Send invite email when a new member login is created", value=True)
 
-        refresh.click(fn=_refresh_members_screen, inputs=[], outputs=[member_pick, table])
+            save_btn = gr.Button("Save member and sync login")
 
-        member_pick.change(fn=_load_member_details, inputs=[member_pick], outputs=[name, email, phone, is_active])
+            owner_out = gr.Textbox(label="Result", interactive=False)
+            table = gr.Dataframe(value=_members_df(), interactive=False)
+            accounts_table = gr.Dataframe(value=_user_accounts_df(), interactive=False)
 
-        save_btn.click(fn=_save_member_by_selection, inputs=[member_pick, name, email, phone, is_active], outputs=[out, table, member_pick])
+            refresh.click(
+                fn=_refresh_members_screen,
+                inputs=[],
+                outputs=[member_pick, current_linked_login, table, accounts_table],
+            )
 
-        # initial list
-        gr.on(triggers=[demo.load], fn=_load_members_dropdown, inputs=[], outputs=[member_pick])
+            member_pick.change(
+                fn=_load_member_details,
+                inputs=[member_pick],
+                outputs=[
+                    name,
+                    email,
+                    phone,
+                    is_active,
+                    email_enabled,
+                    sms_enabled,
+                    whatsapp_enabled,
+                    current_linked_login,
+                ],
+            )
+
+            save_btn.click(
+                fn=_save_member_by_selection,
+                inputs=[member_pick, name, email, phone, is_active, email_enabled, sms_enabled, whatsapp_enabled, send_invite_email],
+                outputs=[owner_out, table, member_pick, current_linked_login, accounts_table],
+            )
+
+            gr.on(triggers=[demo.load], fn=_load_members_dropdown, inputs=[], outputs=[member_pick])
+            gr.on(triggers=[demo.load], fn=_load_current_linked_user_text, inputs=[member_pick], outputs=[current_linked_login])
+            gr.on(triggers=[demo.load], fn=_user_accounts_df, inputs=[], outputs=[accounts_table])
+
+        with gr.Column(visible=False) as member_self_panel:
+            gr.Markdown("### My profile")
+            member_name = gr.Textbox(label="Name", interactive=False)
+            member_email = gr.Textbox(label="Email", interactive=False)
+            member_phone = gr.Textbox(label="Phone")
+            member_linked_login = gr.Textbox(label="Member login account", interactive=False)
+
+            gr.Markdown("### My reminder preferences")
+            member_email_enabled = gr.Checkbox(label="Allow email reminders", value=True)
+            member_sms_enabled = gr.Checkbox(label="Allow SMS reminders", value=False)
+            member_whatsapp_enabled = gr.Checkbox(label="Allow WhatsApp reminders", value=False)
+            member_save_btn = gr.Button("Save my preferences")
+            member_out = gr.Textbox(label="Result", interactive=False)
+
+            gr.Markdown("### Change password")
+            current_password = gr.Textbox(label="Current password", type="password")
+            new_password = gr.Textbox(label="New password", type="password")
+            confirm_password = gr.Textbox(label="Confirm new password", type="password")
+            password_btn = gr.Button("Update password")
+            password_out = gr.Textbox(label="Password status", interactive=False)
+
+            member_save_btn.click(
+                fn=_save_member_self_service,
+                inputs=[current_role, current_member_id, member_phone, member_email_enabled, member_sms_enabled, member_whatsapp_enabled],
+                outputs=[member_out, member_phone, member_email_enabled, member_sms_enabled, member_whatsapp_enabled, member_linked_login],
+            )
+            password_btn.click(
+                fn=_change_password_from_session,
+                inputs=[current_role, current_user, current_password, new_password, confirm_password],
+                outputs=[password_out, current_password, new_password, confirm_password, current_user, login_status, login_panel, app_panel, current_role, current_member_id],
+            )
+
+            gr.on(
+                triggers=[demo.load],
+                fn=_load_member_self_service,
+                inputs=[current_role, current_member_id],
+                outputs=[
+                    member_name,
+                    member_email,
+                    member_phone,
+                    member_email_enabled,
+                    member_sms_enabled,
+                    member_whatsapp_enabled,
+                    member_linked_login,
+                ],
+            )
+            current_role.change(
+                fn=_load_member_self_service,
+                inputs=[current_role, current_member_id],
+                outputs=[
+                    member_name,
+                    member_email,
+                    member_phone,
+                    member_email_enabled,
+                    member_sms_enabled,
+                    member_whatsapp_enabled,
+                    member_linked_login,
+                ],
+            )
+            current_member_id.change(
+                fn=_load_member_self_service,
+                inputs=[current_role, current_member_id],
+                outputs=[
+                    member_name,
+                    member_email,
+                    member_phone,
+                    member_email_enabled,
+                    member_sms_enabled,
+                    member_whatsapp_enabled,
+                    member_linked_login,
+                ],
+            )
+
+        gr.on(
+            triggers=[demo.load],
+            fn=_members_panel_visibility,
+            inputs=[current_role],
+            outputs=[owner_members_panel, member_self_panel],
+        )
+        current_role.change(
+            fn=_members_panel_visibility,
+            inputs=[current_role],
+            outputs=[owner_members_panel, member_self_panel],
+        )
 
     return
 
 def _refresh_members_screen():
-    return _load_members_dropdown(), gr.update(value=_members_df().copy())
+    return (
+        _load_members_dropdown(),
+        "",
+        gr.update(value=_members_df().copy()),
+        gr.update(value=_user_accounts_df().copy()),
+    )
+
+
+def _members_panel_visibility(role):
+    role = (role or "").strip().upper()
+    return gr.update(visible=(role == "OWNER")), gr.update(visible=(role == "MEMBER"))
 
 def _load_members_dropdown():
     df = _members_df()
@@ -493,18 +655,106 @@ def _load_members_dropdown():
     choices = [f"{row['id']} | {row['name']}" for _, row in df.iterrows()]
     return gr.Dropdown(choices=choices)
 
+
+def _load_current_linked_user_text(member_pick):
+    if not member_pick:
+        return ""
+    member_id = int(str(member_pick).split("|")[0].strip())
+    with SessionLocal() as db:
+        linked = db.execute(select(User).where(User.member_id == member_id, User.role == "MEMBER")).scalars().first()
+        if not linked:
+            return "No member login linked yet."
+        return f"{linked.email} (user #{linked.id})"
+
+
+def _load_member_self_service(role, member_id):
+    role = (role or "").strip().upper()
+    if role != "MEMBER" or member_id is None:
+        return "", "", "", True, False, False, ""
+
+    with SessionLocal() as db:
+        member = db.get(Member, int(member_id))
+        if not member:
+            return "", "", "", True, False, False, "No member record linked."
+        linked = db.execute(select(User).where(User.member_id == int(member_id), User.role == "MEMBER")).scalars().first()
+        linked_value = f"{linked.email} (user #{linked.id})" if linked else "No member login linked yet."
+        return (
+            member.name or "",
+            member.email or "",
+            member.phone or "",
+            bool(member.email_enabled),
+            bool(member.sms_enabled),
+            bool(member.whatsapp_enabled),
+            linked_value,
+        )
+
+
+def _save_member_self_service(role, member_id, phone, email_enabled, sms_enabled, whatsapp_enabled):
+    role = (role or "").strip().upper()
+    if role != "MEMBER" or member_id is None:
+        return "Not allowed.", "", True, False, False, ""
+
+    with SessionLocal() as db:
+        member = db.get(Member, int(member_id))
+        if not member:
+            return "Linked member record not found.", "", True, False, False, ""
+        member.phone = (phone or "").strip() or None
+        member.email_enabled = bool(email_enabled)
+        member.sms_enabled = bool(sms_enabled)
+        member.whatsapp_enabled = bool(whatsapp_enabled)
+        db.commit()
+
+    _, _, updated_phone, updated_email_enabled, updated_sms_enabled, updated_whatsapp_enabled, linked_value = _load_member_self_service(role, member_id)
+    return "Preferences updated.", updated_phone, updated_email_enabled, updated_sms_enabled, updated_whatsapp_enabled, linked_value
+
+
+def _change_password_from_session(role, session_data, current_password, new_password, confirm_password):
+    role = (role or "").strip().upper()
+    if role != "MEMBER":
+        return "Not allowed.", "", "", "", gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+    email = ""
+    if isinstance(session_data, dict):
+        email = (session_data.get("email") or "").strip().lower()
+    result = change_user_password(email, current_password, new_password, confirm_password)
+    if result == "Password updated.":
+        return (
+            "Password updated. Please log in again.",
+            "",
+            "",
+            "",
+            {"logged_in": False, "email": "", "role": "", "member_id": None},
+            "Password updated. Please log in again.",
+            gr.update(visible=True),
+            gr.update(visible=False),
+            "",
+            None,
+        )
+    return result, current_password, new_password, confirm_password, gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+
 def _load_member_details(member_pick):
     if not member_pick:
-        return "", "", "", True
+        return "", "", "", True, True, False, False, ""
     member_id = int(str(member_pick).split("|")[0].strip())
     with SessionLocal() as db:
         m = db.get(Member, member_id)
-        return m.name or "", m.email or "", m.phone or "", bool(m.is_active)
+        linked = db.execute(select(User).where(User.member_id == member_id, User.role == "MEMBER")).scalars().first()
+        linked_value = f"{linked.email} (user #{linked.id})" if linked else "No member login linked yet."
+        return (
+            m.name or "",
+            m.email or "",
+            m.phone or "",
+            bool(m.is_active),
+            bool(m.email_enabled),
+            bool(m.sms_enabled),
+            bool(m.whatsapp_enabled),
+            linked_value,
+        )
 
-def _save_member_by_selection(member_pick, name, email, phone, is_active):
+def _save_member_by_selection(member_pick, name, email, phone, is_active, email_enabled, sms_enabled, whatsapp_enabled, send_invite_email):
     if not name or not str(name).strip():
-        return "❌ Name is required", _members_df(), _load_members_dropdown()
+        return "❌ Name is required", _members_df(), _load_members_dropdown(), _load_current_linked_user_text(member_pick), _user_accounts_df()
 
+    member_id = None
     with SessionLocal() as db:
         if member_pick:
             member_id = int(str(member_pick).split("|")[0].strip())
@@ -513,24 +763,131 @@ def _save_member_by_selection(member_pick, name, email, phone, is_active):
             m.email = (email or "").strip() or None
             m.phone = (phone or "").strip() or None
             m.is_active = 1 if is_active else 0
+            m.email_enabled = bool(email_enabled)
+            m.sms_enabled = bool(sms_enabled)
+            m.whatsapp_enabled = bool(whatsapp_enabled)
         else:
-            crud.get_or_create_member(db, name=str(name).strip(), email=email or None, phone=phone or None)
+            m = crud.get_or_create_member(db, name=str(name).strip(), email=email or None, phone=phone or None)
+            m.is_active = 1 if is_active else 0
+            m.email_enabled = bool(email_enabled)
+            m.sms_enabled = bool(sms_enabled)
+            m.whatsapp_enabled = bool(whatsapp_enabled)
         db.commit()
+        member_id = int(m.id)
+
+    sync_result = ensure_member_user_for_member(email or "", member_id)
+    invite_note = ""
+    if sync_result.ok and sync_result.created and sync_result.user_email and sync_result.temp_password:
+        invite_note = f"\nTemporary password: {sync_result.temp_password}"
+        if send_invite_email:
+            invite_note += _send_member_invite(sync_result.user_email, sync_result.temp_password)
+
     df = _members_df().copy()
-    return "✅ Saved", gr.update(value=df), _load_members_dropdown()
+    member_dropdown = _load_members_dropdown()
+    selected_value = member_pick if member_pick else _member_pick_from_id(member_id)
+    try:
+        member_dropdown.value = selected_value
+    except Exception:
+        pass
+    status_prefix = "✅ Saved"
+    if not sync_result.ok:
+        status_prefix = "⚠️ Saved member, but login sync needs attention"
+    return (
+        f"{status_prefix}\n{sync_result.message}{invite_note}",
+        gr.update(value=df),
+        member_dropdown,
+        _load_current_linked_user_text(selected_value),
+        gr.update(value=_user_accounts_df().copy()),
+    )
+
+
+def _send_member_invite(email: str, temp_password: str) -> str:
+    subject, text_body, html_body = build_member_invite_email(email, temp_password)
+    try:
+        asyncio.run(send_email(email, subject, text_body, html_body))
+        mark_invite_sent(email)
+        return "\nInvite email sent."
+    except Exception as exc:
+        return f"\nInvite email could not be sent: {exc}"
 
 def _members_df():
     with SessionLocal() as db:
         members = crud.list_members(db)
-    return pd.DataFrame([{"id": m.id, "name": m.name, "email": m.email or "", "phone": m.phone or ""} for m in members])
+        linked_users = {
+            user.member_id: user.email
+            for user in db.execute(select(User).where(User.role == "MEMBER", User.member_id.is_not(None))).scalars().all()
+            if user.member_id is not None
+        }
+    return pd.DataFrame([
+        {
+            "id": m.id,
+            "name": m.name,
+            "email": m.email or "",
+            "phone": m.phone or "",
+            "active": bool(m.is_active),
+            "email_enabled": bool(m.email_enabled),
+            "sms_enabled": bool(m.sms_enabled),
+            "whatsapp_enabled": bool(m.whatsapp_enabled),
+            "linked_user_email": linked_users.get(m.id, ""),
+        }
+        for m in members
+    ])
+
+
+def _user_accounts_df():
+    with SessionLocal() as db:
+        users = db.execute(select(User).order_by(User.role, User.email)).scalars().all()
+        for user in users:
+            _ = user.member
+    return pd.DataFrame([
+        {
+            "user_id": user.id,
+            "email": user.email,
+            "role": (user.role or "").upper(),
+            "active": bool(user.is_active),
+            "linked_member_id": user.member_id or "",
+            "linked_member_name": user.member.name if user.member and user.member.name else "",
+            "invite_sent_at": user.invite_sent_at.isoformat() if user.invite_sent_at else "",
+            "last_login_at": user.last_login_at.isoformat() if user.last_login_at else "",
+            "invite_pending": "YES" if user.invite_sent_at and not user.last_login_at else "",
+            "assignable_as_member_login": "YES" if (user.role or "").upper() == "MEMBER" else "NO",
+        }
+        for user in users
+    ])
+
+
+def _member_pick_from_id(member_id):
+    if member_id is None:
+        return None
+    with SessionLocal() as db:
+        m = db.get(Member, int(member_id))
+        if not m:
+            return None
+        return f"{m.id} | {m.name}"
 
 
 def _invoice_choice_label(inv: Invoice) -> str:
     return f"{inv.id} | {inv.year}-{inv.month} | total=${float(inv.total_amount or 0.0):.2f}"
 
-def _load_invoice_and_member_choices():
+def _load_invoice_and_member_choices(role=None, member_id=None):
+    role = (role or "").strip().upper()
     with SessionLocal() as db:
-        invoices = db.execute(select(Invoice).order_by(Invoice.year.desc(), Invoice.month.desc(), Invoice.id.desc())).scalars().all()
+        invoice_query = select(Invoice)
+        if role == "MEMBER" and member_id is not None:
+            try:
+                mid = int(member_id)
+            except Exception:
+                mid = None
+            if mid is not None:
+                invoice_query = (
+                    invoice_query
+                    .join(Allocation, Allocation.invoice_id == Invoice.id)
+                    .where(Allocation.member_id == mid)
+                    .distinct()
+                )
+        invoices = db.execute(
+            invoice_query.order_by(Invoice.year.desc(), Invoice.month.desc(), Invoice.id.desc())
+        ).scalars().all()
         invoice_choices = [_invoice_choice_label(inv) for inv in invoices]
 
         members = crud.list_members(db)
@@ -636,7 +993,7 @@ def _recompute_owner_for_selected_invoice(invoice_pick):
     return "✅ Recomputed owner allocation", _invoice_allocations_df(invoice_id)
 
 
-def ui_invoices(demo, current_role):
+def ui_invoices(demo, current_role, current_member_id):
     def _invoices_owner_controls_update(role):
         role = (role or "").strip().upper()
         is_owner = role != "MEMBER"
@@ -713,7 +1070,11 @@ def ui_invoices(demo, current_role):
         alloc_msg = gr.Textbox(label="Allocation status", interactive=False)
 
         # --- Wiring ---
-        refresh_btn.click(fn=_load_invoice_and_member_choices, inputs=[], outputs=[invoice_pick, member_pick])
+        refresh_btn.click(
+            fn=_load_invoice_and_member_choices,
+            inputs=[current_role, current_member_id],
+            outputs=[invoice_pick, member_pick],
+        )
 
         # Selecting invoice loads details + allocations
         invoice_pick.change(
@@ -750,7 +1111,7 @@ def ui_invoices(demo, current_role):
         gr.on(
             triggers=[demo.load],
             fn=_load_invoice_and_member_choices,
-            inputs=[],
+            inputs=[current_role, current_member_id],
             outputs=[invoice_pick, member_pick],
         )
         gr.on(
@@ -763,6 +1124,16 @@ def ui_invoices(demo, current_role):
             fn=_invoices_owner_controls_update,
             inputs=[current_role],
             outputs=[invoice_editor_controls, alloc_editor_controls, inv_year, inv_month, inv_total, invoice_msg, alloc_msg],
+        )
+        current_role.change(
+            fn=_load_invoice_and_member_choices,
+            inputs=[current_role, current_member_id],
+            outputs=[invoice_pick, member_pick],
+        )
+        current_member_id.change(
+            fn=_load_invoice_and_member_choices,
+            inputs=[current_role, current_member_id],
+            outputs=[invoice_pick, member_pick],
         )
 
     return
@@ -1359,23 +1730,65 @@ def _reminder_logs_df(limit=50, member_filter=None, success_filter="All", curren
                 member_id = int(forced_member_id)
             except Exception:
                 member_id = None
-    else:
+    elif role == "OWNER":
         if member_filter:
             try:
                 member_id = int(str(member_filter).split("|")[0].strip())
             except Exception:
                 member_id = None
+    else:
+        return pd.DataFrame()
 
     with SessionLocal() as db:
+        pending_rows = db.execute(
+            select(ReminderLog)
+            .where(ReminderLog.provider == "TWILIO")
+            .where(ReminderLog.provider_message_id.is_not(None))
+            .where(ReminderLog.provider_status.in_(("accepted", "queued", "sending", "sent", "delivered", "read", "undelivered", "failed")))
+            .order_by(ReminderLog.created_at.desc())
+            .limit(25)
+        ).scalars().all()
+
+        for log in pending_rows:
+            current_status = str(log.provider_status or "").lower()
+            if current_status in {"delivered", "read", "failed", "undelivered"}:
+                continue
+
+            latest = fetch_message_status(log.provider_message_id or "")
+            next_status = str(latest.get("provider_status") or log.provider_status or "").upper()
+            log.provider_status = next_status or log.provider_status
+            log.status = next_status or log.status
+
+            next_error = latest.get("error")
+            next_error_code = latest.get("error_code")
+            if next_error is not None:
+                log.error = next_error
+            if next_error_code is not None:
+                log.error_code = next_error_code
+
+            if next_status in {"DELIVERED", "READ", "SENT", "QUEUED", "ACCEPTED"} and not next_error:
+                log.success = 1
+            elif next_status in {"FAILED", "UNDELIVERED", "SYNC_FAILED"} or next_error:
+                log.success = 0
+
+        if pending_rows:
+            db.commit()
+
         q = (
             select(
                 ReminderLog.created_at,
                 Member.name.label("member"),
+                ReminderLog.channel,
+                ReminderLog.recipient,
                 ReminderLog.email,
                 ReminderLog.amount,
                 ReminderLog.success,
                 ReminderLog.error,
+                ReminderLog.error_code,
                 ReminderLog.subject,
+                ReminderLog.provider,
+                ReminderLog.provider_message_id,
+                ReminderLog.provider_status,
             )
             .join(Member, Member.id == ReminderLog.member_id)
             .order_by(ReminderLog.created_at.desc())
@@ -1396,10 +1809,16 @@ def _reminder_logs_df(limit=50, member_filter=None, success_filter="All", curren
     df = pd.DataFrame([{
         "sent_at": (r.created_at.isoformat() if r.created_at else ""),
         "member": r.member,
+        "channel": r.channel or "EMAIL",
+        "recipient": r.recipient or r.email or "",
         "email": r.email,
         "amount": float(r.amount or 0.0),
         "status": "SUCCESS" if int(r.success) == 1 else "FAILED",
+        "provider": r.provider or "",
+        "provider_status": r.provider_status or "",
+        "provider_message_id": r.provider_message_id or "",
         "error": r.error or "",
+        "error_code": r.error_code or "",
         "subject": r.subject or "",
     } for r in rows])
 
@@ -1414,6 +1833,7 @@ def _reminder_member_filter_choices():
 def ui_reminders(current_role, current_member_id):
     with gr.Column():
         gr.Markdown("## Reminder Logs")
+        auto_refresh = gr.Timer(value=15.0)
 
         with gr.Row():
             member_filter = gr.Dropdown(
@@ -1465,6 +1885,11 @@ def ui_reminders(current_role, current_member_id):
         clear_filter.click(fn=_clear, inputs=[current_role, current_member_id], outputs=[member_filter, success_filter, limit, logs_table])
         current_role.change(fn=_init_reminders_view, inputs=[current_role, current_member_id], outputs=[member_filter, logs_table])
         current_member_id.change(fn=_init_reminders_view, inputs=[current_role, current_member_id], outputs=[member_filter, logs_table])
+        auto_refresh.tick(
+            fn=_reminder_logs_df,
+            inputs=[limit, member_filter, success_filter, current_role, current_member_id],
+            outputs=[logs_table],
+        )
 
 
 

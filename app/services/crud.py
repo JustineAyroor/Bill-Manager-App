@@ -2,7 +2,7 @@ from datetime import date
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
-from app.db.models import Member, Invoice, Allocation, Payment
+from app.db.models import Member, Invoice, Allocation, Payment, User
 
 
 def get_or_create_member(db: Session, name: str, email: str | None = None, phone: str | None = None) -> Member:
@@ -22,6 +22,23 @@ def get_or_create_member(db: Session, name: str, email: str | None = None, phone
 
 def list_members(db: Session) -> list[Member]:
     return list(db.execute(select(Member).order_by(Member.name)).scalars().all())
+
+
+def list_member_users(db: Session) -> list[User]:
+    return list(
+        db.execute(
+            select(User)
+            .where(User.role == "MEMBER")
+            .order_by(User.email)
+        ).scalars().all()
+    )
+
+
+def get_member_user_by_email(db: Session, email: str) -> User | None:
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return None
+    return db.execute(select(User).where(User.email == normalized)).scalar_one_or_none()
 
 def update_invoice_total(db, invoice_id: int, total_amount: float) -> None:
     inv = db.get(Invoice, invoice_id)
