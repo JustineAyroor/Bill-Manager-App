@@ -19,6 +19,10 @@ PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 class ReminderPolicy:
     owner_name: str = "Justine"
     min_balance: float = 10.0
+    # cooldown_days is the "production" default (used only if cooldown_minutes
+    # is left as None). The app currently always passes cooldown_minutes=5
+    # explicitly (see app/ui/screens.py), so that 5-minute value - not
+    # cooldown_days - is what's actually enforced and shown in the UI today.
     cooldown_days: int = 7
     cooldown_minutes: int | None = None
 
@@ -68,6 +72,10 @@ def last_reminder_map(db: Session, channels: Iterable[str] | None = None) -> dic
     rows = db.execute(
         select(ReminderLog.member_id, ReminderLog.channel, func.max(ReminderLog.created_at))
         .where(ReminderLog.channel.in_(selected_channels))
+        # A failed attempt (bad SMTP/Twilio config, network issue, etc.) never
+        # actually reached the recipient, so it shouldn't start the cooldown
+        # clock and block a legitimate retry.
+        .where(ReminderLog.success == 1)
         .group_by(ReminderLog.member_id, ReminderLog.channel)
     ).all()
     return {
@@ -81,9 +89,10 @@ def compute_reminder_candidates(
     db: Session,
     policy: ReminderPolicy,
     channels: Iterable[str] | None = None,
+    plan_id: int | None = None,
 ) -> List[ReminderCandidate]:
     selected_channels = normalize_reminder_channels(channels)
-    balances = member_balances(db)
+    balances = member_balances(db, plan_id=plan_id)
 
     member_rows = db.execute(
         select(
@@ -215,8 +224,9 @@ def get_eligible_reminder_candidates(
     db: Session,
     policy: ReminderPolicy,
     channels: Iterable[str] | None = None,
+    plan_id: int | None = None,
 ) -> List[ReminderCandidate]:
-    return [c for c in compute_reminder_candidates(db, policy, channels) if c.eligible]
+    return [c for c in compute_reminder_candidates(db, policy, channels, plan_id=plan_id) if c.eligible]
 
 def build_reminder_message(member_name: str, balance: float) -> tuple[str, str, str]:
     subject = "T-Mobile plan payment reminder"

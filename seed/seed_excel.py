@@ -4,8 +4,12 @@ import sys
 import pandas as pd
 from datetime import datetime, date
 
+from sqlalchemy import select
+
 from app.db.database import SessionLocal
+from app.db.models import Plan
 from app.services import crud
+from app.services import plans as plans_service
 
 
 MONTH_MAP = {
@@ -46,7 +50,7 @@ def parse_date(x) -> date:
     raise ValueError(f"Unrecognized date format: {x}")
 
 
-def import_allocations(db, df: pd.DataFrame):
+def import_allocations(db, df: pd.DataFrame, plan_id: int):
     """
     Expected columns:
       Year | Month | <member1> | <member2> | ...
@@ -56,10 +60,10 @@ def import_allocations(db, df: pd.DataFrame):
         raise ValueError("allocations sheet must include columns: Year, Month, InvoiceTotal")
 
     member_cols = [c for c in cols if c not in ("Year", "Month", "InvoiceTotal")]
-    # Create members first
+    # Create members first, and associate them with the target plan.
     members = {}
     for name in member_cols:
-        m = crud.get_or_create_member(db, name=str(name).strip())
+        m = crud.get_or_create_member(db, name=str(name).strip(), plan_id=plan_id)
         members[name] = m
 
     # Rows -> invoices + allocations
@@ -72,7 +76,7 @@ def import_allocations(db, df: pd.DataFrame):
         if not month:
             continue
         invoice_total = float(row.get("InvoiceTotal", 0) or 0)
-        inv = crud.upsert_invoice(db, year=year, month=month, total_amount=invoice_total)
+        inv = crud.upsert_invoice(db, plan_id, year=year, month=month, total_amount=invoice_total)
         for mcol in member_cols:
             val = row.get(mcol, 0)
             if pd.isna(val):
@@ -83,7 +87,7 @@ def import_allocations(db, df: pd.DataFrame):
             crud.upsert_allocation(db, invoice_id=inv.id, member_id=members[mcol].id, amount_due=amount_due)
 
 
-def import_transactions(db, df: pd.DataFrame):
+def import_transactions(db, df: pd.DataFrame, plan_id: int):
     """
     Flexible ledger import.
 
@@ -106,9 +110,9 @@ def import_transactions(db, df: pd.DataFrame):
     base_cols = {"Date", "Currency", "Description", "Amount", "Direction", "Member"}
     member_cols = [c for c in cols if c not in base_cols]
 
-    # Create those members
+    # Create those members and associate them with the target plan.
     for mc in member_cols:
-        crud.get_or_create_member(db, str(mc).strip())
+        crud.get_or_create_member(db, str(mc).strip(), plan_id=plan_id)
 
     for _, row in df.iterrows():
         when = parse_date(row["Date"])
@@ -121,12 +125,12 @@ def import_transactions(db, df: pd.DataFrame):
             if pd.isna(v) or float(v) == 0.0:
                 continue
             any_member_payment = True
-            m = crud.get_or_create_member(db, str(mc).strip())
+            m = crud.get_or_create_member(db, str(mc).strip(), plan_id=plan_id)
             amt = float(v)
 
             # In your screenshot, inbound payments appear positive in member column; negatives can happen
             direction = "INBOUND" if amt > 0 else "OUTBOUND"
-            crud.add_payment(db, when=when, amount=abs(amt), direction=direction, description=desc, member_id=m.id)
+            crud.add_payment(db, plan_id, when=when, amount=abs(amt), direction=direction, description=desc, member_id=m.id)
 
         if any_member_payment:
             # also store overall transaction amount (optional) — skip to avoid duplicates
@@ -142,29 +146,48 @@ def import_transactions(db, df: pd.DataFrame):
         member_name = row.get("Member")
         member_id = None
         if not pd.isna(member_name) and str(member_name).strip():
-            m = crud.get_or_create_member(db, str(member_name).strip())
+            m = crud.get_or_create_member(db, str(member_name).strip(), plan_id=plan_id)
             member_id = m.id
 
         # If INBOUND but no member_id, keep it as OUTBOUND/unknown to avoid corrupting balances
         if direction == "INBOUND" and member_id is None:
             direction = "OUTBOUND"
 
-        crud.add_payment(db, when=when, amount=abs(amt_raw), direction=direction, description=desc, member_id=member_id)
+        crud.add_payment(db, plan_id, when=when, amount=abs(amt_raw), direction=direction, description=desc, member_id=member_id)
 
 
-def main(xlsx_path: str):
+def main(xlsx_path: str, plan_name: str | None = None):
+    """
+    plan_name: which plan to import this workbook into. Defaults to the
+    existing default plan (the one created by the multi-plan migration for
+    all pre-existing data) if omitted; created if it doesn't exist yet, so
+    you can seed a brand-new plan/household by just naming it here.
+    """
     xls = pd.ExcelFile(xlsx_path)
     sheets = [s.lower() for s in xls.sheet_names]
 
     with SessionLocal() as db:
+        if plan_name:
+            plan = db.execute(select(Plan).where(Plan.name == plan_name)).scalar_one_or_none()
+            if plan is None:
+                plan = plans_service.create_plan(db, name=plan_name)
+                db.flush()
+        else:
+            plan = plans_service.get_default_plan(db)
+            if plan is None:
+                plan = plans_service.create_plan(db, name=plans_service.DEFAULT_PLAN_NAME, carrier_type="T-Mobile")
+                db.flush()
+        plan_id = plan.id
+        print(f"ℹ️ Importing into plan: '{plan.name}' (id={plan_id})")
+
         if "allocations" in sheets:
             df_alloc = pd.read_excel(xlsx_path, sheet_name=xls.sheet_names[sheets.index("allocations")])
-            import_allocations(db, df_alloc)
+            import_allocations(db, df_alloc, plan_id)
             print("✅ Imported allocations")
 
         if "transactions" in sheets:
             df_tx = pd.read_excel(xlsx_path, sheet_name=xls.sheet_names[sheets.index("transactions")])
-            import_transactions(db, df_tx)
+            import_transactions(db, df_tx, plan_id)
             print("✅ Imported transactions")
 
         db.commit()
@@ -173,6 +196,6 @@ def main(xlsx_path: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: uv run python seed/seed_excel.py path/to/your.xlsx")
+        print("Usage: uv run python seed/seed_excel.py path/to/your.xlsx [plan_name]")
         sys.exit(1)
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)

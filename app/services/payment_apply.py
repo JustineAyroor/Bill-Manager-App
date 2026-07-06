@@ -37,24 +37,31 @@ def clear_member_applications(db: Session, member_id: int) -> None:
     db.query(PaymentApplication).filter(PaymentApplication.member_id == member_id).delete(synchronize_session=False)
 
 
-def member_unapplied_credit(db: Session, member_id: int) -> float:
-    inbound_total = db.execute(
-        select(func.coalesce(func.sum(Payment.amount), 0.0))
-        .where(Payment.direction == "INBOUND", Payment.member_id == member_id)
-    ).scalar_one()
+def member_unapplied_credit(db: Session, member_id: int, plan_id: int | None = None) -> float:
+    inbound_stmt = select(func.coalesce(func.sum(Payment.amount), 0.0)).where(
+        Payment.direction == "INBOUND", Payment.member_id == member_id
+    )
+    applied_stmt = select(func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0)).where(
+        PaymentApplication.member_id == member_id
+    )
+    if plan_id is not None:
+        inbound_stmt = inbound_stmt.where(Payment.plan_id == plan_id)
+        applied_stmt = applied_stmt.join(Invoice, Invoice.id == PaymentApplication.invoice_id).where(
+            Invoice.plan_id == plan_id
+        )
 
-    applied_total = db.execute(
-        select(func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0))
-        .where(PaymentApplication.member_id == member_id)
-    ).scalar_one()
+    inbound_total = db.execute(inbound_stmt).scalar_one()
+    applied_total = db.execute(applied_stmt).scalar_one()
 
     return float(inbound_total) - float(applied_total)
 
 
 def auto_apply_payment_fifo(db: Session, payment_id: int) -> tuple[list[ApplyRow], float]:
     """
-    Apply THIS inbound payment FIFO to oldest unpaid allocations for that member.
-    Safe to run for new payments.
+    Apply THIS inbound payment FIFO to oldest unpaid allocations for that
+    member, restricted to the payment's own plan (Payment.plan_id) - a
+    payment can only ever settle invoices from the plan it was recorded
+    against, even if the member belongs to multiple plans.
     """
     p = db.get(Payment, int(payment_id))
     if not p:
@@ -73,7 +80,7 @@ def auto_apply_payment_fifo(db: Session, payment_id: int) -> tuple[list[ApplyRow
 
     month_case = _invoice_month_case()
 
-    allocs = db.execute(
+    allocs_stmt = (
         select(
             Allocation.invoice_id,
             Allocation.amount_due,
@@ -82,8 +89,12 @@ def auto_apply_payment_fifo(db: Session, payment_id: int) -> tuple[list[ApplyRow
         )
         .join(Invoice, Invoice.id == Allocation.invoice_id)
         .where(Allocation.member_id == p.member_id)
-        .order_by(Invoice.year.asc(), month_case.asc(), Allocation.id.asc())
-    ).all()
+    )
+    if p.plan_id is not None:
+        allocs_stmt = allocs_stmt.where(Invoice.plan_id == p.plan_id)
+    allocs_stmt = allocs_stmt.order_by(Invoice.year.asc(), month_case.asc(), Allocation.id.asc())
+
+    allocs = db.execute(allocs_stmt).all()
 
     results: list[ApplyRow] = []
 
@@ -130,38 +141,51 @@ def auto_apply_payment_fifo(db: Session, payment_id: int) -> tuple[list[ApplyRow
     return results, float(remaining)
 
 
-def reconcile_member_fifo(db: Session, member_id: int) -> dict:
+def reconcile_member_fifo(db: Session, member_id: int, plan_id: int | None = None) -> dict:
     """
-    Rebuild ALL applications for a member from scratch based on all inbound payments (chronological).
-    This is the safe operation after editing/deleting any payment for that member.
+    Rebuild ALL applications for a member from scratch based on all inbound
+    payments (chronological). Safe to run after editing/deleting any payment
+    for that member. When plan_id is given, only that plan's payments (and
+    hence applications) for this member are rebuilt; other plans' payments
+    and applications for the same member are left untouched.
     """
     m = db.get(Member, int(member_id))
     if not m:
         raise ValueError(f"Member not found: {member_id}")
 
-    # Remove existing applications for this member
-    clear_member_applications(db, m.id)
+    payments_stmt = select(Payment.id, Payment.amount, Payment.date).where(
+        Payment.direction == "INBOUND", Payment.member_id == m.id
+    )
+    if plan_id is not None:
+        payments_stmt = payments_stmt.where(Payment.plan_id == plan_id)
+    payments_stmt = payments_stmt.order_by(Payment.date.asc(), Payment.id.asc())
+    payments = db.execute(payments_stmt).all()
+
+    # Remove existing applications for just these payments (does not disturb
+    # this member's applications in other plans).
+    payment_ids = [p.id for p in payments]
+    if payment_ids:
+        db.query(PaymentApplication).filter(PaymentApplication.payment_id.in_(payment_ids)).delete(
+            synchronize_session=False
+        )
     db.flush()
-    # Re-apply each inbound payment in time order
-    payments = db.execute(
-        select(Payment.id, Payment.amount, Payment.date)
-        .where(Payment.direction == "INBOUND", Payment.member_id == m.id)
-        .order_by(Payment.date.asc(), Payment.id.asc())
-    ).all()
 
     total_inbound = sum(float(p.amount or 0.0) for p in payments)
-    applied_total_before = 0.0
 
     applied_rows = 0
     for pid, _, _ in payments:
         rows, _remainder = auto_apply_payment_fifo(db, int(pid))
         applied_rows += len(rows)
 
-    applied_total_after = db.execute(
-        select(func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0))
-        .where(PaymentApplication.member_id == m.id)
-    ).scalar_one()
-    applied_total_after = float(applied_total_after or 0.0)
+    if plan_id is not None and not payment_ids:
+        applied_total_after = 0.0
+    else:
+        applied_total_stmt = select(func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0)).where(
+            PaymentApplication.member_id == m.id
+        )
+        if plan_id is not None:
+            applied_total_stmt = applied_total_stmt.where(PaymentApplication.payment_id.in_(payment_ids))
+        applied_total_after = float(db.execute(applied_total_stmt).scalar_one() or 0.0)
 
     credit = total_inbound - applied_total_after
 
@@ -176,17 +200,27 @@ def reconcile_member_fifo(db: Session, member_id: int) -> dict:
     }
 
 
-def reconcile_all_members_fifo(db: Session) -> list[dict]:
-    members = db.execute(select(Member.id).order_by(Member.name)).scalars().all()
+def reconcile_all_members_fifo(db: Session, plan_id: int | None = None) -> list[dict]:
+    members_stmt = select(Member.id)
+    if plan_id is not None:
+        from app.db.models import PlanMember
+
+        members_stmt = members_stmt.join(PlanMember, PlanMember.member_id == Member.id).where(
+            PlanMember.plan_id == plan_id
+        )
+    members_stmt = members_stmt.order_by(Member.name)
+    members = db.execute(members_stmt).scalars().all()
+
     results = []
     for mid in members:
         # Skip members with no inbound payments quickly
-        cnt = db.execute(
-            select(func.count())
-            .select_from(Payment)
-            .where(Payment.direction == "INBOUND", Payment.member_id == mid)
-        ).scalar_one()
+        cnt_stmt = select(func.count()).select_from(Payment).where(
+            Payment.direction == "INBOUND", Payment.member_id == mid
+        )
+        if plan_id is not None:
+            cnt_stmt = cnt_stmt.where(Payment.plan_id == plan_id)
+        cnt = db.execute(cnt_stmt).scalar_one()
         if int(cnt) == 0:
             continue
-        results.append(reconcile_member_fifo(db, mid))
+        results.append(reconcile_member_fifo(db, mid, plan_id=plan_id))
     return results

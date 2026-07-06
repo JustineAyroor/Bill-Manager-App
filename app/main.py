@@ -3,9 +3,14 @@ import asyncio
 import gradio as gr
 from app.ui.screens import ui_dashboard, ui_members, ui_invoices, ui_payments, ui_reminders, ui_applications
 from app.ui.bill_import import ui_bill_import
+from app.ui.eval_dashboard import ui_eval_dashboard
+from app.ui.plans_tab import ui_plans
 from app.auth.service import authenticate_user, request_password_reset, reset_password_with_code
 from app.services.account_email_templates import build_password_reset_email
 from app.services.email_service import send_email
+from app.services import authz
+from app.services import bill_import_worker
+from app.db.database import SessionLocal
 
 _BROWSER_STATE_KEY = "tmobile_bill_manager_user"
 _BROWSER_STATE_SECRET = os.environ.get(
@@ -136,8 +141,21 @@ def apply_role_visibility(role):
         gr.update(visible=is_owner or is_member),  # payments_panel
         gr.update(visible=is_owner or is_member),  # reminders_panel
         gr.update(visible=is_owner or is_member),  # applications_panel
-        gr.update(visible=is_owner),               # bill_import_panel
+        gr.update(visible=is_owner or is_member),  # bill_import_panel
+        gr.update(visible=is_owner or is_member),  # plans_panel
+        gr.update(visible=is_owner),                # eval_panel (admin-only, cross-plan)
     )
+
+
+def _load_active_plan_dropdown(role, member_id):
+    with SessionLocal() as db:
+        choices = authz.accessible_plan_choices(db, role, member_id)
+    default_choice = authz.default_plan_choice(choices, role)
+    return gr.update(choices=choices, value=default_choice)
+
+
+def _sync_current_plan_id(plan_choice):
+    return authz.parse_plan_choice(plan_choice)
 
 
 def build_app():
@@ -151,6 +169,7 @@ def build_app():
         )
         current_member_id = gr.State(None)
         current_role = gr.State("")
+        current_plan_id = gr.State(None)
 
         with gr.Column(visible=True) as login_panel:
             gr.Markdown("## Login")
@@ -170,12 +189,20 @@ def build_app():
             reset_status = gr.Textbox(label="Reset status", interactive=False)
 
         with gr.Column(visible=False) as app_panel:
-            logout_btn = gr.Button("Logout")
+            with gr.Row():
+                logout_btn = gr.Button("Logout", scale=0)
+                active_plan_pick = gr.Dropdown(
+                    label="Active plan",
+                    choices=[],
+                    value=None,
+                    scale=1,
+                    info="Scopes Dashboard, Invoices, Payments, Applications and Reminders to this plan.",
+                )
 
             with gr.Tabs() as main_tabs:
                 with gr.Tab("Dashboard"):
                     with gr.Column() as dashboard_panel:
-                        ui_dashboard(demo,current_role, current_member_id)
+                        ui_dashboard(demo, current_role, current_member_id, current_plan_id)
 
                 with gr.Tab("Members"):
                     with gr.Column() as members_panel:
@@ -183,23 +210,37 @@ def build_app():
 
                 with gr.Tab("Invoices & Allocations"):
                     with gr.Column() as invoices_panel:
-                        ui_invoices(demo, current_role, current_member_id)
+                        ui_invoices(demo, current_role, current_member_id, current_plan_id)
 
                 with gr.Tab("Payments"):
                     with gr.Column() as payments_panel:
-                        ui_payments(demo, current_role, current_member_id)
+                        ui_payments(demo, current_role, current_member_id, current_plan_id)
 
                 with gr.Tab("Reminders"):
                     with gr.Column() as reminders_panel:
-                        ui_reminders(current_role, current_member_id)
+                        ui_reminders(current_role, current_member_id, current_plan_id)
 
                 with gr.Tab("Applications"):
                     with gr.Column() as applications_panel:
-                        ui_applications(demo,current_role, current_member_id)
+                        ui_applications(demo, current_role, current_member_id, current_plan_id)
 
                 with gr.Tab("Bill Import (LLM)"):
                     with gr.Column() as bill_import_panel:
-                        ui_bill_import(demo)
+                        ui_bill_import(demo, current_role, current_member_id, current_plan_id)
+
+                with gr.Tab("Plans"):
+                    with gr.Column() as plans_panel:
+                        ui_plans(demo, current_role, current_member_id, active_plan_pick)
+
+                with gr.Tab("AI Eval (admin)"):
+                    with gr.Column() as eval_panel:
+                        ui_eval_dashboard(demo, current_role)
+
+        active_plan_pick.change(
+            fn=_sync_current_plan_id,
+            inputs=[active_plan_pick],
+            outputs=[current_plan_id],
+        )
 
         login_btn.click(
             fn=login_user,
@@ -220,7 +261,13 @@ def build_app():
                 reminders_panel,
                 applications_panel,
                 bill_import_panel,
+                plans_panel,
+                eval_panel,
             ],
+        ).then(
+            fn=_load_active_plan_dropdown,
+            inputs=[current_role, current_member_id],
+            outputs=[active_plan_pick],
         )
 
         forgot_btn.click(
@@ -250,7 +297,13 @@ def build_app():
                 reminders_panel,
                 applications_panel,
                 bill_import_panel,
+                plans_panel,
+                eval_panel,
             ],
+        ).then(
+            fn=_load_active_plan_dropdown,
+            inputs=[current_role, current_member_id],
+            outputs=[active_plan_pick],
         )
 
         demo.load(
@@ -272,8 +325,20 @@ def build_app():
                 reminders_panel,
                 applications_panel,
                 bill_import_panel,
+                plans_panel,
+                eval_panel,
             ],
+        ).then(
+            fn=_load_active_plan_dropdown,
+            inputs=[current_role, current_member_id],
+            outputs=[active_plan_pick],
         )
+
+    # Bill Import v2 (RAG, opt-in) background worker - idempotent to start,
+    # only does work when a job is enqueued via the "Try new AI extraction
+    # (beta)" toggle in the Bill Import tab. The legacy synchronous import
+    # flow does not use this at all.
+    bill_import_worker.start_worker_thread()
 
     return demo
 
