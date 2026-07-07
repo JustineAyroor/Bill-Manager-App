@@ -109,6 +109,28 @@ instance. `deploy.sh`'s health-check loop budgets for up to 5 minutes
 accordingly. This is worth knowing before assuming a "stuck" deploy is
 actually broken.
 
+## Incident: CI/CD deploys silently broken since day one (missing execute bit)
+
+**Symptom:** every push to `master` after the initial hand-run deploy showed up as a **failed** run on the GitHub Actions tab, consistently in ~15-30 seconds - far too fast to be a real deploy (which takes 1-3 minutes just for the app's cold start). `gh run view --log` on the failing run showed:
+
+```text
+bash: line 1: /home/***/apps/Bill-Manager-App/deploy/deploy.sh: Permission denied
+2026/07/07 02:51:15 Process exited with status 126
+```
+
+**Root cause:** `deploy/deploy.sh` and `deploy/backup_db.sh` were committed to git with mode `100644` (non-executable) instead of `100755`. Nobody noticed locally because the file is normally invoked as `bash deploy/deploy.sh` (which doesn't care about the execute bit) - but the GitHub Actions deploy key's forced SSH command invokes the file path directly (`command="/home/.../deploy/deploy.sh"`, see the "GitHub Actions CI/CD" section above), which *does* require it. Every automated deploy since CI/CD was set up failed at the very first line, before `deploy.sh` ever ran `git pull` - meaning the VM's checkout had been silently stuck on an old commit for several pushes (three, by the time this was caught), even though `git push` itself always succeeded and looked fine from the laptop side.
+
+**Why the very first deploy worked:** it was run manually (`bash ~/apps/Bill-Manager-App/deploy/deploy.sh` over SSH), which sidesteps the execute-bit requirement entirely - masking the bug until the *automated* path was actually exercised end-to-end.
+
+**Fix:**
+
+1. `chmod +x deploy/deploy.sh deploy/backup_db.sh` locally, then `git add` + commit - git tracks the executable bit as part of the tree entry, so this is a real, durable fix once committed (mode `100644` -> `100755`), not just a local workaround.
+2. Because the *currently checked-out* files on the VM needed the bit fixed immediately (the next Action run would otherwise still fail before it could even `git pull` the fix), `chmod +x` was also run directly on the VM as an immediate unblock.
+3. That direct VM-side `chmod` then caused a *second*, different failure on the next run: `git pull --ff-only` refused to proceed because the working tree had a local mode-only diff relative to the last commit ("local changes... would be overwritten by merge"). Fixed with `git checkout -- deploy/deploy.sh deploy/backup_db.sh` (discard the local-only mode diff) immediately followed by `git pull --ff-only origin master`, which then landed the commit that already carries the correct mode - so the working tree and the index agree again, and future pulls stay clean.
+4. Ran `deploy.sh` once more by hand to fully complete the interrupted deploy (dependency sync, migrations, restart, health check), since the Action itself had aborted before reaching those steps on every prior attempt.
+
+**Takeaway:** when a forced SSH command invokes a script by path (not via an interpreter), the script's execute bit is part of its behavior contract - verify `git ls-files -s <script>` shows `100755` for anything a deploy key or cron/systemd unit will exec directly, and prefer testing the *automated* trigger at least once (not just a manual run) before considering a CI/CD pipeline verified.
+
 ## Deferred / explicitly not done this round
 
 - Promoting `dev` to `master` and running the accumulated migrations against

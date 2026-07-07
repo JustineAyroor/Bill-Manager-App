@@ -228,6 +228,10 @@ uv run python create_db.py
 
 That's intentional - see the forced-command restriction under "GitHub Actions CI/CD" above.
 
+### GitHub Actions run fails in ~15-30 seconds with "Permission denied" / exit 126
+
+`deploy/deploy.sh` (or `deploy/backup_db.sh`) lost its execute bit - the forced SSH command runs it by path, which needs `chmod +x`, unlike a manual `bash deploy/deploy.sh`. Check with `git ls-files -s deploy/deploy.sh` (should show `100755`, not `100644`); fix with `chmod +x deploy/deploy.sh deploy/backup_db.sh`, commit, and push. If you also `chmod +x` directly on the VM as an immediate unblock, do `git checkout -- deploy/*.sh && git pull --ff-only origin master` there afterward, or the next pull will refuse with "local changes would be overwritten by merge". Full incident writeup: [10-deployment-implementation.md](docs/decisions/2026-07-04-roadmap/10-deployment-implementation.md).
+
 ### SSH disconnects used to kill the app
 
 No longer applicable - the app runs under systemd now, not in a foreground `tmux` session. `tmux` is not used anymore.
