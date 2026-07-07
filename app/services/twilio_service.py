@@ -12,7 +12,7 @@ from app.core.config import (
     TWILIO_STATUS_CALLBACK_URL,
     TWILIO_WHATSAPP_FROM,
 )
-from app.services.reminder_sender import SendResult
+from app.services.notifications.base import SendResult
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 

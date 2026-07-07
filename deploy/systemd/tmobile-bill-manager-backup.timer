@@ -1,0 +1,10 @@
+[Unit]
+Description=Run T-Mobile Bill Manager DB backup daily
+
+[Timer]
+OnCalendar=*-*-* 08:30:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

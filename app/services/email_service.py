@@ -24,6 +24,10 @@ def _validate_email_config():
         raise RuntimeError(f"Missing email config keys in .env: {', '.join(missing)}")
 
 
+def is_email_configured() -> bool:
+    return all([SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, FROM_EMAIL])
+
+
 def _extract_refused(refused_like):
     """
     aiosmtplib versions differ:

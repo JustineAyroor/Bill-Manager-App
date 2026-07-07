@@ -1,13 +1,29 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func, case
-from app.db.models import Member, Allocation, PaymentApplication,Payment
+from app.db.models import Member, Allocation, PaymentApplication, Payment, Invoice, Plan, PlanMember
 
 OWNER_NAME = "Justine"
 
-def plan_totals(db, owner_name="Justine"):
-    rows = member_balances(db)
 
-    non_owner = [r for r in rows if (r["member"] or "").strip().lower() != owner_name.strip().lower()]
+def _plan_owner_member_id(db, plan_id: int | None) -> int | None:
+    if not plan_id:
+        return None
+    plan = db.get(Plan, plan_id)
+    return plan.owner_member_id if plan else None
+
+
+def plan_totals(db, plan_id: int | None = None, owner_name: str = "Justine"):
+    """
+    Aggregate dues/recovered/deficit for one plan (plan_id given) or across
+    all plans (plan_id=None - preserves the original single-plan behavior).
+    """
+    rows = member_balances(db, plan_id=plan_id)
+
+    owner_id = _plan_owner_member_id(db, plan_id)
+    if owner_id is not None:
+        non_owner = [r for r in rows if r["member_id"] != owner_id]
+    else:
+        non_owner = [r for r in rows if (r["member"] or "").strip().lower() != owner_name.strip().lower()]
 
     total_due = sum(max(r["balance"], 0.0) for r in non_owner)     # sum of outstanding only
     recovered = sum(r["total_paid"] for r in non_owner)            # total applied from members
@@ -16,11 +32,12 @@ def plan_totals(db, owner_name="Justine"):
     # original_due = sum(r["total_due"] for r in non_owner)
     # deficit = original_due - recovered
 
-    # Total bill paid by owner = sum OUTBOUND payments
-    total_paid_owner = db.execute(
-        select(func.coalesce(func.sum(Payment.amount), 0.0))
-        .where(Payment.direction == "OUTBOUND")
-    ).scalar_one()
+    # Total bill paid by owner = sum OUTBOUND payments, scoped by
+    # Payment.plan_id directly (every payment now belongs to exactly one plan).
+    outbound_stmt = select(func.coalesce(func.sum(Payment.amount), 0.0)).where(Payment.direction == "OUTBOUND")
+    if plan_id is not None:
+        outbound_stmt = outbound_stmt.where(Payment.plan_id == plan_id)
+    total_paid_owner = db.execute(outbound_stmt).scalar_one()
     total_paid_owner = abs(float(total_paid_owner or 0.0))  # outbound stored positive in your UI; if negative, abs helps
 
     return {
@@ -29,6 +46,22 @@ def plan_totals(db, owner_name="Justine"):
         "plan_deficit": round(deficit, 2),
         "owner_total_outbound": round(total_paid_owner, 2),
     }
+
+
+def all_plans_totals(db) -> list[dict]:
+    """Per-plan breakdown for cross-plan spend analytics, plus a combined row."""
+    out = []
+    for plan in db.execute(select(Plan).order_by(Plan.name)).scalars().all():
+        totals = plan_totals(db, plan_id=plan.id)
+        totals["plan_id"] = plan.id
+        totals["plan_name"] = plan.name
+        out.append(totals)
+
+    combined = plan_totals(db, plan_id=None)
+    combined["plan_id"] = None
+    combined["plan_name"] = "All plans (combined)"
+    out.append(combined)
+    return out
 
 # def plan_totals(db: Session) -> dict:
 #     # Total Due = allocations excluding owner
@@ -71,28 +104,34 @@ def plan_totals(db, owner_name="Justine"):
 #         "total_bill_paid": float(total_bill_paid),
 #     }
 
-def member_balances(db):
+def member_balances(db, plan_id: int | None = None):
+    """
+    Per-member due/paid/balance. When plan_id is given, scopes to that plan's
+    roster and only counts allocations/applications tied to that plan's
+    invoices. When plan_id is None, preserves the original all-members/
+    all-invoices behavior (single implicit plan).
+    """
     # due per member
-    due_sq = (
-        select(
-            Allocation.member_id.label("member_id"),
-            func.coalesce(func.sum(Allocation.amount_due), 0.0).label("total_due"),
-        )
-        .group_by(Allocation.member_id)
-        .subquery()
-    )
+    due_sq = select(
+        Allocation.member_id.label("member_id"),
+        func.coalesce(func.sum(Allocation.amount_due), 0.0).label("total_due"),
+    ).select_from(Allocation)
+    if plan_id is not None:
+        due_sq = due_sq.join(Invoice, Invoice.id == Allocation.invoice_id).where(Invoice.plan_id == plan_id)
+    due_sq = due_sq.group_by(Allocation.member_id).subquery()
 
     # applied per member
-    applied_sq = (
-        select(
-            PaymentApplication.member_id.label("member_id"),
-            func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0).label("total_applied"),
+    applied_sq = select(
+        PaymentApplication.member_id.label("member_id"),
+        func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0).label("total_applied"),
+    ).select_from(PaymentApplication)
+    if plan_id is not None:
+        applied_sq = applied_sq.join(Invoice, Invoice.id == PaymentApplication.invoice_id).where(
+            Invoice.plan_id == plan_id
         )
-        .group_by(PaymentApplication.member_id)
-        .subquery()
-    )
+    applied_sq = applied_sq.group_by(PaymentApplication.member_id).subquery()
 
-    rows = db.execute(
+    members_stmt = (
         select(
             Member.id,
             Member.name,
@@ -102,8 +141,16 @@ def member_balances(db):
         .select_from(Member)
         .outerjoin(due_sq, due_sq.c.member_id == Member.id)
         .outerjoin(applied_sq, applied_sq.c.member_id == Member.id)
-        .order_by(Member.name)
-    ).all()
+    )
+    if plan_id is not None:
+        members_stmt = members_stmt.join(PlanMember, PlanMember.member_id == Member.id).where(
+            PlanMember.plan_id == plan_id
+        )
+    members_stmt = members_stmt.order_by(Member.name)
+
+    rows = db.execute(members_stmt).all()
+
+    owner_id = _plan_owner_member_id(db, plan_id)
 
     out = []
     for r in rows:
@@ -111,7 +158,8 @@ def member_balances(db):
         paid = float(r.total_applied or 0.0)
 
         # Owner gets outbound credit
-        if r.name == OWNER_NAME:
+        is_owner = (r.id == owner_id) if owner_id is not None else (r.name == OWNER_NAME)
+        if is_owner:
             paid += float(r.total_due or 0.0)
 
         bal = due - paid  # outstanding (negative means credit)

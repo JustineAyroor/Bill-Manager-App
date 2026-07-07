@@ -1,0 +1,29 @@
+name: Deploy to production VM
+
+# Only triggers on master - dev work lands here via a deliberate merge,
+# not automatically on every push to dev. See
+# docs/decisions/2026-07-04-roadmap/10-deployment-implementation.md.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          # The deploy key's authorized_keys entry on the VM has a forced
+          # `command=".../deploy/deploy.sh"`, so whatever we "run" here is
+          # actually ignored server-side - deploy.sh always runs instead.
+          # Keeping an explicit script here anyway for clarity/logs.
+          script: echo "triggering deploy.sh (server-enforced via forced command)"
+          command_timeout: 10m
