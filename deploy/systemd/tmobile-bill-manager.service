@@ -1,0 +1,28 @@
+[Unit]
+Description=T-Mobile Bill Manager (Gradio app)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=justineayroor
+Group=justineayroor
+WorkingDirectory=/home/justineayroor/apps/Bill-Manager-App
+# Secrets are intentionally NOT loaded here via EnvironmentFile: the app
+# already reads .env itself via python-dotenv's load_dotenv() in
+# app/core/config.py, and the .env file uses `export KEY=value` syntax
+# which systemd's EnvironmentFile parser does not support (it logs each
+# line as an "invalid environment assignment" to the journal - including
+# the raw secret value - and silently ignores it).
+Environment=PATH=/home/justineayroor/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/justineayroor/.local/bin/uv run python -m app.main
+Restart=on-failure
+RestartSec=5
+# Give the Gradio app time to release the port on the way down before a
+# forced kill, so a redeploy's restart doesn't race a slow shutdown.
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
