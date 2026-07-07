@@ -4,6 +4,8 @@ This folder captures a planning discussion about the next phase of the Bill Mana
 
 Each topic has its own file so it can later be lifted out and turned into a standalone write-up (blog post, internal doc, etc.) without dragging in the others.
 
+> **New to this project?** These are decision records written as work happened - great for understanding *why* something is built a certain way, but not the place to start. Read [README.md](../../../README.md) and [SPECIFICATION.md](../../../SPECIFICATION.md) first, then come back here for the reasoning behind any specific feature.
+
 ## Topics
 
 1. [Deployment & GCP Architecture](01-deployment-and-gcp-architecture.md) - moving off manual `tmux`, streamlining redeploys, and picking a GCP shape suited to a low-load personal project.

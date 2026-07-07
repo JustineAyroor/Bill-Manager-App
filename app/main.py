@@ -159,8 +159,8 @@ def _sync_current_plan_id(plan_choice):
 
 
 def build_app():
-    with gr.Blocks(title="T-Mobile Bill Manager") as demo:
-        gr.Markdown("# T-Mobile Bill Manager (Local MVP)")
+    with gr.Blocks(title="Bill Manager (T-Mobile & more)") as demo:
+        gr.Markdown("# Bill Manager (T-Mobile & more)")
 
         current_user = gr.BrowserState(
             _empty_session(),

@@ -3,11 +3,11 @@ from __future__ import annotations
 from app.core.config import APP_BASE_URL
 
 def build_member_invite_email(login_email: str, temp_password: str) -> tuple[str, str, str]:
-    subject = "Your T-Mobile Bill Manager account"
+    subject = "Your Bill Manager (T-Mobile & more) account"
     login_url = APP_BASE_URL or "http://localhost:7860"
     text_body = (
         f"Hi,\n\n"
-        f"An account was created for you in the T-Mobile Bill Manager.\n\n"
+        f"An account was created for you in Bill Manager (T-Mobile & more).\n\n"
         f"Open the app: {login_url}\n"
         f"Login email: {login_email}\n"
         f"Temporary password: {temp_password}\n\n"
@@ -17,12 +17,12 @@ def build_member_invite_email(login_email: str, temp_password: str) -> tuple[str
     <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#111;line-height:1.5;">
       <div style="max-width:560px;margin:0 auto;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;">
         <div style="background:#111827;color:#fff;padding:18px 20px;">
-          <div style="font-size:18px;font-weight:700;">T-Mobile Bill Manager</div>
+          <div style="font-size:18px;font-weight:700;">Bill Manager (T-Mobile & more)</div>
           <div style="font-size:12px;opacity:0.8;margin-top:4px;">Account setup</div>
         </div>
         <div style="padding:20px;">
           <p style="margin:0 0 12px 0;">Hi,</p>
-          <p style="margin:0 0 16px 0;">An account was created for you in the T-Mobile Bill Manager.</p>
+          <p style="margin:0 0 16px 0;">An account was created for you in Bill Manager (T-Mobile & more).</p>
 
           <p style="margin:0 0 16px 0;">
             <a href="{login_url}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:600;">
@@ -47,7 +47,7 @@ def build_member_invite_email(login_email: str, temp_password: str) -> tuple[str
 
 
 def build_password_reset_email(login_email: str, reset_code: str, expires_minutes: int) -> tuple[str, str, str]:
-    subject = "Reset your T-Mobile Bill Manager password"
+    subject = "Reset your Bill Manager (T-Mobile & more) password"
     login_url = APP_BASE_URL or "http://localhost:7860"
     text_body = (
         f"Hi,\n\n"
@@ -62,7 +62,7 @@ def build_password_reset_email(login_email: str, reset_code: str, expires_minute
       <div style="max-width:560px;margin:0 auto;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden;">
         <div style="background:#0f766e;color:#fff;padding:18px 20px;">
           <div style="font-size:18px;font-weight:700;">Password reset</div>
-          <div style="font-size:12px;opacity:0.8;margin-top:4px;">T-Mobile Bill Manager</div>
+          <div style="font-size:12px;opacity:0.8;margin-top:4px;">Bill Manager (T-Mobile & more)</div>
         </div>
         <div style="padding:20px;">
           <p style="margin:0 0 12px 0;">Hi,</p>

@@ -22,6 +22,32 @@ Current deployment style:
 - static IP
 - no reverse proxy yet, no HTTPS yet (an nginx package happens to be installed but is not wired up to the app)
 
+## Architecture at a glance
+
+```mermaid
+flowchart TB
+    Dev["Your laptop\n(git push to master)"] --> GHA["GitHub Actions\n(.github/workflows/deploy.yml)"]
+    GHA -- "SSH, restricted deploy key" --> VM
+
+    subgraph VM ["GCP e2-micro VM (billingmanager-jayroor)"]
+        Deploy["deploy/deploy.sh\nbackup -> git pull -> uv sync -> migrate -> restart"]
+        Systemd["systemd\ntmobile-bill-manager.service\n(Restart=on-failure)"]
+        App["App process\n(uv run python -m app.main)"]
+        DB[("tmobile.db\n(SQLite)")]
+        LocalBackup["deploy/backup_db.sh\n(daily timer + pre-deploy)"]
+        Deploy --> Systemd --> App --> DB
+        LocalBackup --> DB
+    end
+
+    Owner["Owner (you)"] -- "public IP:7860" --> App
+    Owner -- "Tailscale (private, additive)" --> App
+    Member["Plan members"] -- "public IP:7860" --> App
+
+    VM -. "boot-disk snapshot\n(daily, 14-day retention)" .-> Snapshot[("GCE snapshot\n(off-VM disaster recovery)")]
+```
+
+Two independent safety nets: the local SQLite backup is for a fast single-file rollback (e.g. a bad migration), and the GCE disk snapshot is for full disaster recovery (lost/corrupted VM or disk entirely) - see "Backups" below for both.
+
 ## Current Public URL Pattern
 
 ```text
