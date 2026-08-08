@@ -20,6 +20,7 @@ Current deployment style:
 - **GitHub Actions** auto-deploys on every push to `master` over SSH with a dedicated, restricted deploy key
 - Daily **local SQLite backups** (systemd timer) plus a daily **GCE boot-disk snapshot schedule** for real off-VM disaster recovery
 - static IP
+- A 1GB **swap file** (`vm.swappiness=10`) cushions memory spikes on this `e2-micro`'s ~1GB RAM - added after an outage traced to disk/memory pressure wedging the guest OS (see Troubleshooting below)
 - no reverse proxy yet, no HTTPS yet (an nginx package happens to be installed but is not wired up to the app)
 
 ## Architecture at a glance
@@ -227,6 +228,22 @@ uv run python create_db.py
 ### Deploy key doesn't seem to do anything except run deploy.sh
 
 That's intentional - see the forced-command restriction under "GitHub Actions CI/CD" above.
+
+### VM shows `RUNNING` but nothing responds - not SSH, not the app
+
+Don't assume it's a firewall problem just because you can't connect - check the firewall rules (`gcloud compute firewall-rules list`) quickly to rule that out, but if *both* port 22 and port 7860 are timing out identically, the guest OS itself is probably wedged, not blocked. Read the serial console - it works even with a fully dead network stack, since it's exposed by the hypervisor, not the guest:
+
+```bash
+gcloud compute instances get-serial-port-output billingmanager-jayroor --zone=us-central1-f --port=1 | tail -100
+```
+
+Look for `systemd-journald.service: Watchdog timeout` and/or `systemctl: ... Transport endpoint is not connected` - both indicate systemd itself has cascaded into a fully unresponsive state, usually from disk or memory pressure. Fix: a hard reset (does not touch the boot disk):
+
+```bash
+gcloud compute instances reset billingmanager-jayroor --zone=us-central1-f
+```
+
+`systemd` will auto-start the app on boot (that's what `enabled` + `Restart=on-failure` are for) - give it 1-3 minutes for the usual `e2-micro` cold start, then re-check. Afterward, check `df -h /` and clean up disk space, but **do one cleanup operation at a time** on this box - `apt-get autoremove`, `snap remove`, and `fstrim` run together are enough concurrent CPU/memory pressure on a 1GB-RAM `e2-micro` to wedge it a second time. Full incident writeup: [10-deployment-implementation.md](docs/decisions/2026-07-04-roadmap/10-deployment-implementation.md).
 
 ### GitHub Actions run fails in ~15-30 seconds with "Permission denied" / exit 126
 

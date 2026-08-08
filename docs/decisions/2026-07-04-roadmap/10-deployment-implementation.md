@@ -131,6 +131,81 @@ bash: line 1: /home/***/apps/Bill-Manager-App/deploy/deploy.sh: Permission denie
 
 **Takeaway:** when a forced SSH command invokes a script by path (not via an interpreter), the script's execute bit is part of its behavior contract - verify `git ls-files -s <script>` shows `100755` for anything a deploy key or cron/systemd unit will exec directly, and prefer testing the *automated* trigger at least once (not just a manual run) before considering a CI/CD pipeline verified.
 
+## Incident: guest-OS wedge from disk pressure, then a self-inflicted second wedge during cleanup
+
+**Symptom (reported by the owner):** "I can't connect to my VM directly from gcloud... the application is down but the VM is still up." `gcloud compute instances describe` confirmed status `RUNNING`, but *both* SSH (port 22) and the app (port 7860) timed out identically - no connection refused, no response at all, just a hang until timeout.
+
+### Diagnosis: reading the serial console instead of guessing
+
+Both ports failing the same way pointed away from a firewall/network-config problem (and indeed, `gcloud compute firewall-rules list` showed `allow-gradio-7860` and `default-allow-ssh` both present, enabled, `0.0.0.0/0` - untouched) and toward the VM's own network stack being unresponsive. When *nothing* over the network works but the instance API still reports `RUNNING`, the only way in is the **serial console** - it's exposed by the hypervisor directly, independent of whatever state the guest OS's network stack is in:
+
+```bash
+gcloud compute instances get-serial-port-output billingmanager-jayroor --zone=us-central1-f --port=1
+```
+
+This is a genuinely useful trick worth remembering: it requires no SSH, no working network inside the guest, and no prior setup - it just works as long as the instance is running at all. The tail of the log told the whole story:
+
+```text
+[3063481.860552] systemd[1]: systemd-journald.service: Watchdog timeout (limit 3min)!
+[3063958.287614] systemd[1]: Failed to start systemd-journald.service - Journal Service.
+[3064320.486850] systemd[1]: Failed to start systemd-journald.service - Journal Service.
+   ... (repeated hundreds of times over multiple hours) ...
+[3087976.569434] systemctl[765993]: Failed to retrieve unit state: Transport endpoint is not connected
+[3088318.341807] systemctl[765997]: Failed to get load state of NetworkManager.service: Connection timed out
+```
+
+**Root cause:** `journald` (the systemd logging service) hit its internal watchdog timeout and could not restart - repeatedly, for hours. Because `journald` is a core, socket-activated systemd component, its failure cascaded into `systemd` itself becoming unable to answer *any* control request (`Transport endpoint is not connected`), which in turn meant nothing else - including the network stack - could be managed or restarted either. The instance was technically "running" at the hypervisor level the whole time, but the guest OS inside it was completely wedged. The most likely trigger: the VM had been up **38 days without a reboot**, and disk usage had already been flagged at ~83% back in July (see the dev-to-master promotion doc) - on an `e2-micro` with a single small boot disk, sustained disk pressure combined with `journald`'s own disk-backed buffering is a well-known way to trigger exactly this failure mode.
+
+### Fix #1: a hard reset
+
+```bash
+gcloud compute instances reset billingmanager-jayroor --zone=us-central1-f
+```
+
+This power-cycles the VM at the hypervisor level - equivalent to holding a physical power button, and critically, **it does not touch the boot disk**, so no data risk. Within ~80 seconds of boot, `systemd` (now working again) auto-started `tmobile-bill-manager.service` on its own - exactly the payoff of having moved off `tmux` and onto `systemd` with `enabled` + `Restart=on-failure` back in the original hardening round. The app answered `HTTP 200` shortly after.
+
+### The mistake: fixing disk pressure caused a second outage
+
+With the app back up, the obvious next question was "why was disk so full, and will this happen again?" A directory-size sweep (`sudo du -h -d 2 /`) found the single largest offender immediately:
+
+```text
+3.6G  /snap
+2.8G  /snap/google-cloud-cli
+```
+
+The `gcloud` CLI had been installed on the VM itself as a snap package at some point - and it's completely unused there (all deploys, backups, and diagnostics run *from the owner's laptop*, never from the VM). Confirmed unused (`grep -rl gcloud deploy/ app/` found nothing) and removed:
+
+```bash
+sudo snap remove google-cloud-cli
+```
+
+That alone freed disk usage from 81% down to 78% safely. But immediately afterward, in the same session, three more cleanup commands were run in quick succession: `sudo apt-get clean`, `sudo apt-get -y autoremove --purge` (to clear old kernel packages), and letting the pending `fstrim` run. On an `e2-micro` (1 shared vCPU, **~1GB RAM total**), stacking that much simultaneous disk/CPU/IO work - on top of the app itself already running - was enough to push the box back into trouble: `snapd` crashed outright (`SIGABRT`), systemd's watchdog killed and restarted it, `systemd-resolved` logged repeated "under memory pressure, flushing caches," and the VM went unreachable a second time - a self-inflicted repeat of the exact same class of failure, this time from memory pressure rather than disk pressure.
+
+**Fix #2:** the same hard reset as before. App confirmed healthy again afterward, and disk usage had in fact improved for real this time - **69% used, 2.7G free** (the `fstrim` and package cleanup had actually completed; they just couldn't do so gracefully while contending with everything else live).
+
+### Prevention: a swap file, chosen deliberately over a bigger instance
+
+Two options were on the table: resize to a larger machine type (`e2-small`, 2GB RAM) for more headroom, or add a swap file to cushion memory spikes on the existing `e2-micro` for zero extra cost. The owner chose the swap file - free, no resize/reboot required, and sufficient as a safety margin rather than routine capacity:
+
+```bash
+sudo fallocate -l 1G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab   # persist across reboots
+sudo sysctl -w vm.swappiness=10                              # only swap under real pressure, not routinely
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+```
+
+`vm.swappiness=10` (default is 60) deliberately keeps the kernel from swapping proactively - this is meant purely as an emergency cushion for a memory spike, not as a substitute for having enough RAM for normal operation. Net result versus where the incident started: disk at 80% (the swap file itself used back some of the reclaimed space) but now backed by 1GB of swap that didn't exist before, and the unnecessary 2.8GB `gcloud` snap gone for good.
+
+### Takeaways
+
+1. **The serial console is the right first diagnostic step whenever a GCE VM is `RUNNING` but totally unreachable on the network.** It requires no working SSH and no prior setup, and it will show you *why* in the guest's own words, rather than guessing between firewall/network/guest-OS causes from the outside.
+2. **A VM that's `RUNNING` at the API level can still have a fully wedged guest OS.** `journald`'s watchdog timeout cascading into "systemd can't do anything, including networking" is a real and apparently reproducible failure mode under sustained disk pressure - not something we'd previously seen documented for this project.
+3. **On a resource-constrained instance (`e2-micro`, ~1GB RAM), maintenance operations that are individually safe are not necessarily safe *together*.** `snap remove`, `apt-get autoremove --purge`, and `fstrim` are all routine, low-risk operations on a normal machine; stacked concurrently on a 1GB-RAM box that's also serving live traffic, they pushed the same class of failure right back. The fix going forward: run maintenance operations **one at a time**, watching health in between, on a machine this small - or accept a short planned restart window instead of trying to stay zero-downtime through heavy cleanup.
+4. **A swap file is a legitimate, free, zero-downtime way to add a memory safety margin to an already-provisioned instance** - it's not a substitute for right-sizing if the box is *routinely* short on memory, but it's a sensible first response to an occasional spike, especially paired with a low `vm.swappiness` so it doesn't become a routine performance crutch.
+
 ## Deferred / explicitly not done this round
 
 - Promoting `dev` to `master` and running the accumulated migrations against
