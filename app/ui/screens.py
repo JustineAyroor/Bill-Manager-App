@@ -26,7 +26,7 @@ from app.services.reminder_sender import send_reminder, sync_provider_status
 from app.services.notifications.registry import configured_channels
 from app.services.account_email_templates import build_member_invite_email
 from app.services.email_service import send_email
-from app.services.payment_apply import auto_apply_payment_fifo
+from app.services.payment_apply import reconcile_member_fifo
 from app.auth.service import change_user_password, ensure_member_user_for_member, mark_invite_sent
 import re
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -246,7 +246,7 @@ def _plan_totals_html(plan_id=None):
       </div>
 
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
-        { _pill("Tip", "Use Reconcile after editing payments to rebuild applications accurately.") }
+        { _pill("Tip", "Adding, editing, or deleting a payment rebuilds applications automatically. Totals refresh when you return to this tab.") }
         { _pill("Note", "‘Success’ email logs mean queued, not guaranteed delivered.") }
       </div>
 
@@ -295,7 +295,7 @@ def _df_balances(role="", member_id=None, plan_id=None):
 
     return df
 
-def ui_dashboard(demo, current_role, current_member_id, current_plan_id):
+def ui_dashboard(demo, current_role, current_member_id, current_plan_id, ledger_revision=None):
     def _can_send_reminders(role, member_id, plan_id):
         with SessionLocal() as db:
             return authz.can_manage_plan(db, role, member_id, plan_id)
@@ -408,6 +408,24 @@ def ui_dashboard(demo, current_role, current_member_id, current_plan_id):
         gr.on(triggers=_plan_reload_triggers, fn=_df_balances, inputs=[current_role, current_member_id, current_plan_id], outputs=[balances])
         gr.on(triggers=_plan_reload_triggers, fn=_plan_totals_html, inputs=[current_plan_id], outputs=[totals_html])
         gr.on(triggers=_plan_reload_triggers, fn=_preview_reminders_for_role, inputs=[current_role, current_member_id, current_plan_id, reminder_channels], outputs=[preview_table])
+
+        # Refresh KPIs/chart/table when payments are added, edited, deleted, or reconciled
+        if ledger_revision is not None:
+            ledger_revision.change(
+                fn=_balances_chart_plotly,
+                inputs=[current_role, current_member_id, current_plan_id, show_only_owed, sort_by],
+                outputs=[chart],
+            )
+            ledger_revision.change(
+                fn=_df_balances,
+                inputs=[current_role, current_member_id, current_plan_id],
+                outputs=[balances],
+            )
+            ledger_revision.change(
+                fn=_plan_totals_html,
+                inputs=[current_plan_id],
+                outputs=[totals_html],
+            )
 
     return
 
@@ -1419,24 +1437,40 @@ def _add_payment_v4(when, direction, member_pick, invoice_pick, amount, descript
         )
 
         preview_df = pd.DataFrame()
-        if direction == "INBOUND":
-            rows, remainder = auto_apply_payment_fifo(db, p.id)
+        if direction == "INBOUND" and member_id:
+            # Rebuild FIFO for the whole member so a newly added (possibly
+            # earlier-dated) payment lands on the oldest unpaid invoices, not
+            # on whatever happened to still be open after later payments.
+            reconcile_member_fifo(db, member_id, plan_id=plan_id)
+            app_rows = db.execute(
+                select(
+                    Invoice.year,
+                    Invoice.month,
+                    Allocation.amount_due,
+                    PaymentApplication.amount_applied,
+                )
+                .select_from(PaymentApplication)
+                .join(Invoice, Invoice.id == PaymentApplication.invoice_id)
+                .join(
+                    Allocation,
+                    (Allocation.invoice_id == PaymentApplication.invoice_id)
+                    & (Allocation.member_id == PaymentApplication.member_id),
+                )
+                .where(PaymentApplication.payment_id == p.id)
+                .order_by(Invoice.year.asc(), Invoice.id.asc())
+            ).all()
             preview_df = pd.DataFrame([{
-                "invoice": r.invoice_label,
-                "due": round(r.due, 2),
-                "prev_paid": round(r.previously_applied, 2),
-                "paid_now": round(r.applied_now, 2),
-                "remaining": round(r.remaining_after, 2),
-            } for r in rows])
-
+                "invoice": f"{r.year}-{r.month}",
+                "due": round(float(r.amount_due or 0.0), 2),
+                "paid_now": round(float(r.amount_applied or 0.0), 2),
+            } for r in app_rows])
+            applied_now = sum(float(r.amount_applied or 0.0) for r in app_rows)
+            remainder = max(float(p.amount or 0.0) - applied_now, 0.0)
             if remainder > 0:
-                # show credit row
                 preview_df = pd.concat([preview_df, pd.DataFrame([{
                     "invoice": "UNAPPLIED CREDIT",
                     "due": "",
-                    "prev_paid": "",
                     "paid_now": round(remainder, 2),
-                    "remaining": "",
                 }])], ignore_index=True)
 
         db.commit()
@@ -1504,6 +1538,11 @@ def _save_payment_edits_v4(payment_id, when, direction, member_pick, invoice_pic
         return "❌ Amount must be > 0"
 
     with SessionLocal() as db:
+        p = db.get(Payment, int(payment_id))
+        if not p:
+            return "❌ Payment not found"
+        old_member_id = p.member_id
+        old_plan_id = p.plan_id
         crud.update_payment(
             db,
             payment_id=int(payment_id),
@@ -1514,6 +1553,15 @@ def _save_payment_edits_v4(payment_id, when, direction, member_pick, invoice_pic
             member_id=member_id,
             invoice_id=invoice_id,
         )
+        db.flush()
+        # Rebuild FIFO applications for every member/plan this edit touched.
+        affected = []
+        if old_member_id:
+            affected.append((old_member_id, old_plan_id))
+        if member_id and (member_id, p.plan_id) not in affected:
+            affected.append((member_id, p.plan_id))
+        for mid, pid in affected:
+            reconcile_member_fifo(db, mid, plan_id=pid)
         db.commit()
 
     return "✅ Payment updated"
@@ -1524,7 +1572,16 @@ def _delete_payment_v4(payment_id):
         return ("❌ No payment selected", None, "Pick a payment and click **Load**.", None, "", "INBOUND", None, None, 0.0, "")
 
     with SessionLocal() as db:
+        p = db.get(Payment, int(payment_id))
+        if not p:
+            return ("❌ Payment not found", None, "Pick a payment and click **Load**.", None, "", "INBOUND", None, None, 0.0, "")
+        member_id = p.member_id
+        plan_id = p.plan_id
         crud.delete_payment(db, int(payment_id))
+        # Remaining inbound payments for this member must be re-applied FIFO
+        # so older invoices pick up coverage the deleted payment was holding.
+        if member_id:
+            reconcile_member_fifo(db, member_id, plan_id=plan_id)
         db.commit()
 
     return ("✅ Payment deleted", None, "Pick a payment and click **Load**.", None, "", "INBOUND", None, None, 0.0, "")
@@ -1533,8 +1590,6 @@ def _reconcile_member(member_pick, plan_id=None):
     mid = _parse_id(member_pick)
     if not mid:
         return "❌ Select a member", pd.DataFrame()
-
-    from app.services.payment_apply import reconcile_member_fifo
 
     with SessionLocal() as db:
         res = reconcile_member_fifo(db, mid, plan_id=plan_id)
@@ -1558,7 +1613,7 @@ def _reconcile_all(plan_id=None):
     df = pd.DataFrame(results)
     return f"✅ Reconciled {len(results)} members", df
     
-def ui_payments(demo, current_role, current_member_id, current_plan_id):
+def ui_payments(demo, current_role, current_member_id, current_plan_id, ledger_revision=None):
     def _can_write(role, member_id, plan_id):
         with SessionLocal() as db:
             return authz.can_manage_plan(db, role, member_id, plan_id)
@@ -1845,6 +1900,13 @@ def ui_payments(demo, current_role, current_member_id, current_plan_id):
         )
         delete_btn.click(fn=_payment_pick_update, inputs=[current_plan_id], outputs=[payment_pick])
 
+        def _bump_ledger(rev):
+            return int(rev or 0) + 1
+
+        if ledger_revision is not None:
+            for _btn in (add_btn, save_btn, delete_btn, reconcile_btn, reconcile_all_btn):
+                _btn.click(fn=_bump_ledger, inputs=[ledger_revision], outputs=[ledger_revision])
+
     return
 
 
@@ -2079,7 +2141,7 @@ def _refresh_member_choices_for_role(role, member_id, plan_id):
     return gr.update(choices=choices, value=(choices[0] if choices else None), visible=True)
 
 
-def ui_applications(demo, current_role, current_member_id, current_plan_id):
+def ui_applications(demo, current_role, current_member_id, current_plan_id, ledger_revision=None):
     with gr.Column():
         gr.Markdown("## Payment Applications (verify allocations)")
         gr.Markdown("_Scoped to the Active plan selected at the top of the app._")
@@ -2131,6 +2193,13 @@ def ui_applications(demo, current_role, current_member_id, current_plan_id):
         outputs=[credit_box, by_invoice, app_rows],
         )
 
+        if ledger_revision is not None:
+            ledger_revision.change(
+                fn=_refresh_all,
+                inputs=[current_role, current_member_id, current_plan_id, member_pick],
+                outputs=[credit_box, by_invoice, app_rows],
+            )
+
     member_pick.change(
         fn=_refresh_all,
         inputs=[current_role, current_member_id, current_plan_id, member_pick],
@@ -2167,12 +2236,14 @@ def _member_applications_by_invoice_df(member_pick, plan_id=None):
             .subquery()
         )
 
-        # 2) Applied per invoice (from applications only)
+        # 2) Applied per invoice (from applications whose parent payment still exists)
         app_sq = (
             select(
                 PaymentApplication.invoice_id.label("invoice_id"),
                 func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0).label("applied"),
             )
+            .select_from(PaymentApplication)
+            .join(Payment, Payment.id == PaymentApplication.payment_id)
             .where(PaymentApplication.member_id == mid)
             .group_by(PaymentApplication.invoice_id)
             .subquery()

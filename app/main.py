@@ -170,6 +170,7 @@ def build_app():
         current_member_id = gr.State(None)
         current_role = gr.State("")
         current_plan_id = gr.State(None)
+        ledger_revision = gr.State(0)
 
         with gr.Column(visible=True) as login_panel:
             gr.Markdown("## Login")
@@ -202,7 +203,7 @@ def build_app():
             with gr.Tabs() as main_tabs:
                 with gr.Tab("Dashboard"):
                     with gr.Column() as dashboard_panel:
-                        ui_dashboard(demo, current_role, current_member_id, current_plan_id)
+                        ui_dashboard(demo, current_role, current_member_id, current_plan_id, ledger_revision)
 
                 with gr.Tab("Members"):
                     with gr.Column() as members_panel:
@@ -214,7 +215,7 @@ def build_app():
 
                 with gr.Tab("Payments"):
                     with gr.Column() as payments_panel:
-                        ui_payments(demo, current_role, current_member_id, current_plan_id)
+                        ui_payments(demo, current_role, current_member_id, current_plan_id, ledger_revision)
 
                 with gr.Tab("Reminders"):
                     with gr.Column() as reminders_panel:
@@ -222,7 +223,7 @@ def build_app():
 
                 with gr.Tab("Applications"):
                     with gr.Column() as applications_panel:
-                        ui_applications(demo, current_role, current_member_id, current_plan_id)
+                        ui_applications(demo, current_role, current_member_id, current_plan_id, ledger_revision)
 
                 with gr.Tab("Bill Import (LLM)"):
                     with gr.Column() as bill_import_panel:

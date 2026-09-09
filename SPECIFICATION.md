@@ -114,7 +114,9 @@ An owner-only **"Inspect a job"** view surfaces the raw prompt/response/cost for
 
 - `Payment` rows are scoped to a plan, with a `direction` (`INBOUND` = member paid the owner, `OUTBOUND` = owner paid the carrier/other) and an optional link to a member and/or invoice.
 - `PaymentApplication` rows record how a payment was applied against a specific invoice/member balance - a single payment can be split across multiple invoices.
-- Balances are always recomputed from `Allocation` + `PaymentApplication`, never stored as a running total, so they can't drift out of sync.
+- Adding an INBOUND payment auto-applies it FIFO against that member's oldest unpaid allocations on the same plan.
+- Editing or deleting a payment clears the affected applications and rebuilds FIFO for that member, so dashboard recovered/outstanding totals always match the remaining payments. You do not need to click Reconcile after a delete for balances to update (Reconcile ALL is still available to repair historical leftovers).
+- Balances are always recomputed from `Allocation` + `PaymentApplication` (joined to a still-existing `Payment`), never stored as a running total, so they can't drift out of sync. Application rows whose parent payment is gone are ignored in totals and purged on reconcile / by migration `n11`. See [docs/bug-resolutions.md](docs/bug-resolutions.md) for the delete/edit bugs that used to leave dashboard totals stale.
 
 ### 2.8 Reminder System
 
@@ -261,6 +263,9 @@ erDiagram
 - Notification providers: [app/services/notifications/](app/services/notifications/)
 - Database bootstrap: [create_db.py](create_db.py)
 - Seed importer: [seed/seed_excel.py](seed/seed_excel.py)
+- Payment application / FIFO rebuild: [app/services/payment_apply.py](app/services/payment_apply.py)
+- Ledger bug log: [docs/bug-resolutions.md](docs/bug-resolutions.md)
+- Payment-balance regression tests: [tests/test_payment_balances.py](tests/test_payment_balances.py)
 
 ### 3.5 Environment and Configuration
 
@@ -295,7 +300,7 @@ Expected usage envelope: fewer than 100 users, low concurrent activity, light tr
 - **No reverse proxy or HTTPS yet** - the app is served plaintext HTTP over a raw IP:port. Fine for the current trust level, not fine if this ever needed a real domain or public-facing use.
 - **The production VM is resource-constrained**: as of the most recent deploy (adding the RAG v2 dependencies - `chromadb`, `langchain`, `onnxruntime`, etc.), disk sits around 83% used and idle memory headroom is a few hundred MB. Not currently a problem, but worth a proactive disk resize before it becomes one - see [11-dev-to-master-promotion.md](docs/decisions/2026-07-04-roadmap/11-dev-to-master-promotion.md).
 - **Twilio access was rejected/is unavailable** for this project - the notification-provider abstraction (2.9) exists specifically so this doesn't block reminders entirely; Email is the reliable fallback channel.
-- **No automated test suite yet** - see Section 4.3.
+- **No automated test suite yet** beyond payment-ledger regression tests in `tests/test_payment_balances.py` - see Section 4.3.
 
 ## 4. Non-Functional Expectations
 
@@ -320,7 +325,7 @@ Still open: no reverse proxy/HTTPS, and disk/memory headroom on the VM is worth 
 
 - The codebase stays reasonably compact and layered - business logic centralized in `app/services/`, not scattered through UI callbacks.
 - Growing complexity to watch: `app/ui/screens.py` and `app/ui/bill_import.py` are large files carrying a lot of stateful Gradio interaction logic; a good candidate for future splitting if they keep growing.
-- No automated test suite yet - validation currently relies on a detailed manual test plan ([09-bill-import-v2-manual-test-plan.md](docs/decisions/2026-07-04-roadmap/09-bill-import-v2-manual-test-plan.md)) plus dry-running migrations against a real production-data copy before every promotion (see [11-dev-to-master-promotion.md](docs/decisions/2026-07-04-roadmap/11-dev-to-master-promotion.md)). Adding `pytest` coverage around auth/authz/reminders/allocation math would be the highest-leverage next investment here.
+- **A pytest/unittest suite covers payment add/delete vs dashboard totals** (`tests/test_payment_balances.py`) - the original gap called out below is starting to close around the ledger math. Auth/authz/reminders still rely on the manual test plan ([09-bill-import-v2-manual-test-plan.md](docs/decisions/2026-07-04-roadmap/09-bill-import-v2-manual-test-plan.md)) plus dry-running migrations against a real production-data copy before every promotion (see [11-dev-to-master-promotion.md](docs/decisions/2026-07-04-roadmap/11-dev-to-master-promotion.md)).
 
 ## 5. Product Assumptions
 
@@ -345,7 +350,7 @@ For historical context, everything below was on the original near-term roadmap a
 
 - Nginx reverse proxy + HTTPS (once there's a real domain to point at the static IP).
 - Proactive VM disk resize given current 83% usage (cheap, no-downtime `gcloud compute disks resize`).
-- Automated test coverage (pytest) around auth, plan authorization, and allocation/balance math.
+- Automated test coverage (pytest) around auth, plan authorization, and remaining allocation/balance math. Payment add/delete vs dashboard totals is covered in `tests/test_payment_balances.py`.
 
 ### 6.3 Medium-Term
 

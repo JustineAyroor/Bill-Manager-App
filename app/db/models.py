@@ -112,6 +112,11 @@ class Payment(Base):
     plan = relationship("Plan")
     member = relationship("Member")
     invoice = relationship("Invoice")
+    applications = relationship(
+        "PaymentApplication",
+        back_populates="payment",
+        cascade="all, delete-orphan",
+    )
 
 
 class ReminderLog(Base):
@@ -150,13 +155,13 @@ class PaymentApplication(Base):
     id = Column(Integer, primary_key=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    payment_id = Column(Integer, ForeignKey("payments.id"), nullable=False)
+    payment_id = Column(Integer, ForeignKey("payments.id", ondelete="CASCADE"), nullable=False)
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False)
     member_id = Column(Integer, ForeignKey("members.id"), nullable=False)
 
     amount_applied = Column(Float, nullable=False)
 
-    payment = relationship("Payment")
+    payment = relationship("Payment", back_populates="applications")
     invoice = relationship("Invoice")
     member = relationship("Member")
 

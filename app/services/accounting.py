@@ -120,11 +120,15 @@ def member_balances(db, plan_id: int | None = None):
         due_sq = due_sq.join(Invoice, Invoice.id == Allocation.invoice_id).where(Invoice.plan_id == plan_id)
     due_sq = due_sq.group_by(Allocation.member_id).subquery()
 
-    # applied per member
-    applied_sq = select(
-        PaymentApplication.member_id.label("member_id"),
-        func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0).label("total_applied"),
-    ).select_from(PaymentApplication)
+    # applied per member — only count applications whose parent payment still exists
+    applied_sq = (
+        select(
+            PaymentApplication.member_id.label("member_id"),
+            func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0).label("total_applied"),
+        )
+        .select_from(PaymentApplication)
+        .join(Payment, Payment.id == PaymentApplication.payment_id)
+    )
     if plan_id is not None:
         applied_sq = applied_sq.join(Invoice, Invoice.id == PaymentApplication.invoice_id).where(
             Invoice.plan_id == plan_id

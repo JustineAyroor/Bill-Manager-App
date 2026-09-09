@@ -15,7 +15,7 @@ If you're new to this codebase, start here, then go deeper with:
 - **Plans** - one or more independent "billing groups" (e.g. two different family phone plans), each with its own members and invoices. A single owner account can see everything; a member only sees the plan(s) they belong to.
 - **Invoices & allocations** - record what a monthly bill cost in total, and how it's split across members.
 - **Bill Import (LLM-assisted)** - upload the actual PDF bill and let an LLM propose the split for you, using your plan's known members/identifiers and history as context. See [How Bill Import works](#how-bill-import-works) below.
-- **Payments & applications** - track money coming in from members and going out to the carrier, and apply it against balances.
+- **Payments & applications** - track money coming in from members and going out to the carrier, and apply it against balances. Adding, editing, or deleting a payment rebuilds those applications so dashboard totals stay in sync (see [docs/bug-resolutions.md](docs/bug-resolutions.md)).
 - **Reminders** - nudge members who owe money, over email (and optionally SMS/WhatsApp via Twilio).
 - **Member self-service** - members log in, see only their own data, and manage their own contact preferences and password.
 
@@ -148,6 +148,8 @@ eval/                 Model-accuracy evaluation harness + history (eval/run_eval
 scripts/              Maintenance scripts (e.g. scripts/rebuild_vectorstore.py)
 deploy/               systemd units + deploy.sh + backup_db.sh for production
 seed/                 Excel import for migrating in historical spreadsheet data
+tests/                Ledger regression tests (payment add/delete vs dashboard totals)
+docs/                 Product docs, including [bug-resolutions.md](docs/bug-resolutions.md)
 docs/decisions/       Design-decision write-ups, one per topic, dated by discussion
 create_db.py          Creates tables + runs Alembic migrations (safe to re-run)
 ```
@@ -177,6 +179,12 @@ uv run python -m app.main
 ```
 
 Open **http://127.0.0.1:7860**.
+
+To run the payment-ledger regression tests:
+
+```bash
+uv run python -m unittest tests.test_payment_balances
+```
 
 > Prefer plain `pip`? `python -m venv .venv && source .venv/bin/activate && pip install -e .` still works - `uv` is just faster and guarantees you get the exact versions in `uv.lock`.
 
