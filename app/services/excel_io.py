@@ -117,6 +117,7 @@ def export_excel(db: Session) -> str:
             func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0).label("applied"),
         )
         .select_from(PaymentApplication)
+        .join(Payment, Payment.id == PaymentApplication.payment_id)
         .join(Invoice, Invoice.id == PaymentApplication.invoice_id)
         .join(Member, Member.id == PaymentApplication.member_id)
         .group_by(Invoice.year, Invoice.month, Member.name)

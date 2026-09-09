@@ -33,16 +33,37 @@ def clear_payment_applications(db: Session, payment_id: int) -> None:
     db.query(PaymentApplication).filter(PaymentApplication.payment_id == payment_id).delete(synchronize_session=False)
 
 
-def clear_member_applications(db: Session, member_id: int) -> None:
-    db.query(PaymentApplication).filter(PaymentApplication.member_id == member_id).delete(synchronize_session=False)
+def clear_member_applications(db: Session, member_id: int, plan_id: int | None = None) -> None:
+    q = db.query(PaymentApplication).filter(PaymentApplication.member_id == member_id)
+    if plan_id is not None:
+        plan_invoice_ids = select(Invoice.id).where(Invoice.plan_id == plan_id)
+        q = q.filter(PaymentApplication.invoice_id.in_(plan_invoice_ids))
+    q.delete(synchronize_session=False)
+
+
+def purge_orphan_payment_applications(db: Session) -> int:
+    """Remove application rows whose parent payment no longer exists.
+
+    This heals the historical bug where deleting a payment left applications
+    behind, which kept dashboard recovered/outstanding totals unchanged.
+    """
+    deleted = (
+        db.query(PaymentApplication)
+        .filter(~PaymentApplication.payment_id.in_(select(Payment.id)))
+        .delete(synchronize_session=False)
+    )
+    return int(deleted or 0)
 
 
 def member_unapplied_credit(db: Session, member_id: int, plan_id: int | None = None) -> float:
     inbound_stmt = select(func.coalesce(func.sum(Payment.amount), 0.0)).where(
         Payment.direction == "INBOUND", Payment.member_id == member_id
     )
-    applied_stmt = select(func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0)).where(
-        PaymentApplication.member_id == member_id
+    applied_stmt = (
+        select(func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0))
+        .select_from(PaymentApplication)
+        .join(Payment, Payment.id == PaymentApplication.payment_id)
+        .where(PaymentApplication.member_id == member_id)
     )
     if plan_id is not None:
         inbound_stmt = inbound_stmt.where(Payment.plan_id == plan_id)
@@ -106,6 +127,8 @@ def auto_apply_payment_fifo(db: Session, payment_id: int) -> tuple[list[ApplyRow
 
         prev = db.execute(
             select(func.coalesce(func.sum(PaymentApplication.amount_applied), 0.0))
+            .select_from(PaymentApplication)
+            .join(Payment, Payment.id == PaymentApplication.payment_id)
             .where(
                 PaymentApplication.member_id == p.member_id,
                 PaymentApplication.invoice_id == inv_id
@@ -161,14 +184,13 @@ def reconcile_member_fifo(db: Session, member_id: int, plan_id: int | None = Non
     payments_stmt = payments_stmt.order_by(Payment.date.asc(), Payment.id.asc())
     payments = db.execute(payments_stmt).all()
 
-    # Remove existing applications for just these payments (does not disturb
-    # this member's applications in other plans).
-    payment_ids = [p.id for p in payments]
-    if payment_ids:
-        db.query(PaymentApplication).filter(PaymentApplication.payment_id.in_(payment_ids)).delete(
-            synchronize_session=False
-        )
+    # Wipe this member's applications for the scope being rebuilt, including
+    # orphan rows whose parent payment was already deleted. Clearing only the
+    # remaining payment_ids used to leave those orphans in place, so dashboard
+    # recovered/outstanding totals never moved after a delete.
+    clear_member_applications(db, m.id, plan_id=plan_id)
     db.flush()
+    payment_ids = [p.id for p in payments]
 
     total_inbound = sum(float(p.amount or 0.0) for p in payments)
 
@@ -211,16 +233,26 @@ def reconcile_all_members_fifo(db: Session, plan_id: int | None = None) -> list[
     members_stmt = members_stmt.order_by(Member.name)
     members = db.execute(members_stmt).scalars().all()
 
+    purge_orphan_payment_applications(db)
+
     results = []
     for mid in members:
-        # Skip members with no inbound payments quickly
         cnt_stmt = select(func.count()).select_from(Payment).where(
             Payment.direction == "INBOUND", Payment.member_id == mid
         )
+        app_cnt_stmt = select(func.count()).select_from(PaymentApplication).where(
+            PaymentApplication.member_id == mid
+        )
         if plan_id is not None:
             cnt_stmt = cnt_stmt.where(Payment.plan_id == plan_id)
+            app_cnt_stmt = app_cnt_stmt.join(Invoice, Invoice.id == PaymentApplication.invoice_id).where(
+                Invoice.plan_id == plan_id
+            )
         cnt = db.execute(cnt_stmt).scalar_one()
-        if int(cnt) == 0:
+        app_cnt = db.execute(app_cnt_stmt).scalar_one()
+        # Members with no remaining inbound payments still need a rebuild so
+        # leftover (or orphaned) applications are cleared.
+        if int(cnt) == 0 and int(app_cnt) == 0:
             continue
         results.append(reconcile_member_fifo(db, mid, plan_id=plan_id))
     return results

@@ -138,7 +138,25 @@ def update_payment(db, payment_id, when, amount, direction, description=None, me
 
 
 def delete_payment(db, payment_id):
+    """Delete a payment and its application rows.
+
+    Dashboard totals are derived from PaymentApplication, not Payment, so the
+    applications must be removed in the same operation. SQLite does not
+    enforce foreign keys unless PRAGMA foreign_keys is on, so we cannot rely
+    on ON DELETE CASCADE at the database layer.
+    """
+    from app.services.payment_apply import clear_payment_applications
+
     p = db.get(Payment, int(payment_id))
     if not p:
         raise ValueError(f"Payment not found: {payment_id}")
+    info = {
+        "id": int(p.id),
+        "member_id": p.member_id,
+        "plan_id": p.plan_id,
+        "direction": p.direction,
+    }
+    clear_payment_applications(db, p.id)
     db.delete(p)
+    db.flush()
+    return info
